@@ -12,11 +12,20 @@ from browser_history_refindery.browsers.base import (
 )
 from browser_history_refindery.browsers.snapshot import open_readonly
 
-# Safari stores titles on visits, not items. The bare v.title column combined
-# with MAX(v.visit_time) resolves to the newest visit's title -- a documented
-# SQLite guarantee for bare columns alongside a lone MAX/MIN aggregate.
+# Safari stores titles on visits, not items. Select the newest visit explicitly;
+# the aggregate query needs both MIN and MAX, so SQLite's bare-column rule for a
+# lone MIN/MAX aggregate does not apply.
 _QUERY = """
-    SELECT i.url, v.title, COUNT(v.id), MIN(v.visit_time), MAX(v.visit_time)
+    SELECT i.url,
+           (
+               SELECT newest.title
+               FROM history_visits AS newest
+               WHERE newest.history_item = i.id
+                 AND newest.visit_time > :since
+               ORDER BY newest.visit_time DESC, newest.id DESC
+               LIMIT 1
+           ),
+           COUNT(v.id), MIN(v.visit_time), MAX(v.visit_time)
     FROM history_visits AS v JOIN history_items AS i ON i.id = v.history_item
     WHERE v.visit_time > :since
     GROUP BY i.id

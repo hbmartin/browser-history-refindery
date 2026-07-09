@@ -75,10 +75,16 @@ def _counters_table(stats: RunStats) -> Table:
         f"[red]{stats.errors}[/]",
     )
     table.add_row(
-        "skipped locally",
-        f"[dim]{stats.skipped + stats.already_submitted}[/]",
+        "rejected (422)",
+        f"[yellow]{stats.rejected}[/]",
         "server backlog",
         backlog,
+    )
+    table.add_row(
+        "skipped locally",
+        f"[dim]{stats.skipped + stats.already_submitted}[/]",
+        "",
+        "",
     )
     table.add_row("interval", f"{stats.current_interval:.2f}s", "", "")
     return table
@@ -127,6 +133,7 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
     table.add_row("new pages queued", str(stats.accepted))
     table.add_row("revisits", str(stats.revisits))
     table.add_row("server-blacklisted", str(stats.blacklisted))
+    table.add_row("server-rejected", str(stats.rejected))
     table.add_row("skipped (rules)", str(stats.skipped))
     table.add_row("already submitted", str(stats.already_submitted))
     table.add_row("errors", str(stats.errors))

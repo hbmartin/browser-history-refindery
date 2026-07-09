@@ -11,7 +11,7 @@ import aiosqlite
 from browser_history_refindery.browsers.base import BrowserProfile
 from browser_history_refindery.filters import SkipReason
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS runs (
     submitted   INTEGER NOT NULL DEFAULT 0,
     revisits    INTEGER NOT NULL DEFAULT 0,
     blacklisted INTEGER NOT NULL DEFAULT 0,
+    rejected    INTEGER NOT NULL DEFAULT 0,
     skipped     INTEGER NOT NULL DEFAULT 0,
     errors      INTEGER NOT NULL DEFAULT 0
 );
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     last_error        TEXT,
     run_id            INTEGER NOT NULL REFERENCES runs(id),
     submitted_at      TEXT NOT NULL,
+    last_visit_at     TEXT,
     status_checked_at TEXT
 );
 
@@ -100,6 +102,20 @@ class StateStore:
         await conn.execute("PRAGMA journal_mode = WAL")
         await conn.execute("PRAGMA foreign_keys = ON")
         await conn.executescript(_SCHEMA)
+        cursor = await conn.execute("PRAGMA table_info(submissions)")
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+        if "last_visit_at" not in columns:
+            await conn.execute("ALTER TABLE submissions ADD COLUMN last_visit_at TEXT")
+            await conn.execute(
+                "UPDATE submissions SET last_visit_at = submitted_at "
+                "WHERE last_visit_at IS NULL"
+            )
+        cursor = await conn.execute("PRAGMA table_info(runs)")
+        run_columns = {str(row[1]) for row in await cursor.fetchall()}
+        if "rejected" not in run_columns:
+            await conn.execute(
+                "ALTER TABLE runs ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0"
+            )
         await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await conn.commit()
         self._conn = conn
@@ -128,6 +144,7 @@ class StateStore:
         submitted: int,
         revisits: int,
         blacklisted: int,
+        rejected: int,
         skipped: int,
         errors: int,
     ) -> None:
@@ -135,7 +152,8 @@ class StateStore:
         await self._db.execute(
             """
             UPDATE runs SET finished_at = ?, interrupted = ?, urls_seen = ?,
-                submitted = ?, revisits = ?, blacklisted = ?, skipped = ?, errors = ?
+                submitted = ?, revisits = ?, blacklisted = ?, rejected = ?,
+                skipped = ?, errors = ?
             WHERE id = ?
             """,
             (
@@ -145,6 +163,7 @@ class StateStore:
                 submitted,
                 revisits,
                 blacklisted,
+                rejected,
                 skipped,
                 errors,
                 run_id,
@@ -152,12 +171,21 @@ class StateStore:
         )
         await self._db.commit()
 
-    async def load_submission_times(self) -> dict[str, datetime]:
-        """Map every previously handled URL to when it was last submitted."""
-        cursor = await self._db.execute("SELECT url, submitted_at FROM submissions")
+    async def load_submission_visit_times(self) -> dict[str, datetime]:
+        """Map handled URLs to the newest browser visit represented by each POST."""
+        cursor = await self._db.execute(
+            "SELECT url, COALESCE(last_visit_at, submitted_at) FROM submissions"
+        )
         return {
             row[0]: datetime.fromisoformat(row[1]) for row in await cursor.fetchall()
         }
+
+    async def load_rejected_urls(self) -> set[str]:
+        """Return permanently rejected URLs that must never be retried automatically."""
+        cursor = await self._db.execute(
+            "SELECT url FROM submissions WHERE outcome = 'rejected'"
+        )
+        return {str(row[0]) for row in await cursor.fetchall()}
 
     async def record_submission(
         self,
@@ -165,23 +193,36 @@ class StateStore:
         url: str,
         outcome: str,
         run_id: int,
+        last_visit_at: datetime,
         page_id: str | None = None,
         server_status: str | None = None,
+        last_error: str | None = None,
     ) -> None:
-        """Record one successful POST outcome (queued / revisit / blacklisted)."""
+        """Record one terminal POST outcome for deduplication and resumption."""
         await self._db.execute(
             """
-            INSERT INTO submissions (url, page_id, outcome, server_status, run_id,
-                                     submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO submissions (url, page_id, outcome, server_status, last_error,
+                                     run_id, submitted_at, last_visit_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 page_id = excluded.page_id,
                 outcome = excluded.outcome,
                 server_status = excluded.server_status,
+                last_error = excluded.last_error,
                 run_id = excluded.run_id,
-                submitted_at = excluded.submitted_at
+                submitted_at = excluded.submitted_at,
+                last_visit_at = excluded.last_visit_at
             """,
-            (url, page_id, outcome, server_status, run_id, _now_iso()),
+            (
+                url,
+                page_id,
+                outcome,
+                server_status,
+                last_error,
+                run_id,
+                _now_iso(),
+                last_visit_at.isoformat(),
+            ),
         )
         await self._db.commit()
 
