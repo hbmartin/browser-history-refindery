@@ -8,7 +8,7 @@ import pytest
 
 from browser_history_refindery.browsers.base import BrowserFamily, BrowserProfile
 from browser_history_refindery.filters import SkipKind, SkipReason
-from browser_history_refindery.state import StateStore
+from browser_history_refindery.state import StateSchemaTooNewError, StateStore
 
 
 @pytest.fixture
@@ -136,6 +136,17 @@ async def test_v1_state_migrates_submission_visit_times(tmp_path):
         schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     assert "rejected" in run_columns
     assert schema_version == 3
+
+
+async def test_open_refuses_newer_schema(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+
+    with pytest.raises(StateSchemaTooNewError, match="schema is v99"):
+        async with StateStore(db_path):
+            pass
 
 
 async def test_watermarks(store, tmp_path):
