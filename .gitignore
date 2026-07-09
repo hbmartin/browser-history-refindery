@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# refindery-import local files (config holds the auth token)
+config.toml
+refindery_state.sqlite3*

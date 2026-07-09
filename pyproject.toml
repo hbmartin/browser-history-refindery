@@ -4,7 +4,17 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "questionary>=2.1.1",
+    "rich>=15.0.0",
+    "typer>=0.26.8",
+]
+
+[project.scripts]
+refindery-import = "browser_history_refindery.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/hbmartin/browser-history-refindery"
@@ -18,13 +28,19 @@ dev = [
     "pyrefly>=1.1.1",
     "pyroma>=5.0",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
+    "respx>=0.23.1",
     "ruff>=0.15.20",
     "ty>=0.0.57",
 ]
 
 [tool.pyrefly]
 search-path = ["src", "."]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
@@ -42,7 +58,7 @@ ignore = ["COM812", "D105", "D107", "D203", "D212", "D213", "EM101", "PLR2004", 
 max-args = 10
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["ANN001", "ANN002", "ANN003", "ANN201", "ARG001", "ARG005", "D101", "D102", "D103", "D104", "DTZ003", "ERA001", "F403", "F405", "FBT002", "G004", "N802", "PLC0415", "PLR2004", "PLW1510", "PT011", "PT013", "PTH110", "PTH118", "PTH119", "PTH122", "PTH123", "PTH207", "S101", "S102", "S311", "S603", "S607", "SIM115"]
+"tests/**/*.py" = ["ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "ARG001", "ARG005", "D101", "D102", "D103", "D104", "D401", "DTZ003", "ERA001", "F403", "F405", "FBT002", "G004", "N802", "PLC0415", "PLR2004", "PLW1510", "PT011", "PT013", "PTH110", "PTH118", "PTH119", "PTH122", "PTH123", "PTH207", "S101", "S102", "S106", "S311", "S603", "S607", "SIM115"]
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]
