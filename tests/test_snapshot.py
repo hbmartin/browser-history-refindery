@@ -1,12 +1,15 @@
 """Snapshot copying and Full Disk Access error mapping."""
 
 import shutil
+import sqlite3
+from contextlib import closing
 
 import pytest
 
 from browser_history_refindery.browsers.snapshot import (
     FullDiskAccessError,
     history_snapshot,
+    open_readonly,
 )
 
 
@@ -41,3 +44,16 @@ def test_permission_error_maps_to_fda(tmp_path, monkeypatch):
 def test_missing_file_maps_to_fda(tmp_path):
     with pytest.raises(FullDiskAccessError), history_snapshot(tmp_path / "nope.db"):
         pass
+
+
+def test_open_readonly_encodes_special_characters(tmp_path):
+    db = tmp_path / "History #1?.db"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE sample (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sample (value) VALUES ('works')")
+        conn.commit()
+
+    with closing(open_readonly(db)) as conn:
+        assert conn.execute("SELECT value FROM sample").fetchone() == ("works",)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO sample (value) VALUES ('blocked')")

@@ -2,14 +2,24 @@
 
 import io
 import json
+import sqlite3
+from contextlib import closing
 
 import httpx
+import pytest
 import respx
 from rich.console import Console
 
+from browser_history_refindery.api_client import AuthError
 from browser_history_refindery.browsers import BrowserFamily
+from browser_history_refindery.browsers.base import VisitRecord, to_chromium_us
 from browser_history_refindery.config import AppConfig
-from browser_history_refindery.pipeline import run_import
+from browser_history_refindery.pipeline import (
+    UrlSubmission,
+    _merge_record,
+    _runtime_error_from_group,
+    run_import,
+)
 from browser_history_refindery.state import StateStore
 from tests.conftest import (
     T0,
@@ -93,6 +103,45 @@ def mock_api(router):
     return router.post("/v1/pages").mock(side_effect=_ingest_response)
 
 
+def test_runtime_only_exception_group_unwraps_first_error():
+    first = AuthError()
+    grouped = ExceptionGroup(
+        "task failures",
+        [first, ExceptionGroup("nested", [RuntimeError("other failure")])],
+    )
+    assert _runtime_error_from_group(grouped) is first
+    mixed = ExceptionGroup("mixed", [first, ValueError("invalid response")])
+    assert _runtime_error_from_group(mixed) is None
+
+
+def test_merge_uses_older_nonempty_title_as_fallback(tmp_path):
+    url = "https://title.example/"
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    newer = VisitRecord(
+        url=url,
+        title=None,
+        visit_count=1,
+        first_visit_at=T2,
+        last_visit_at=T2,
+        profile=profile,
+    )
+    older = VisitRecord(
+        url=url,
+        title="Older title",
+        visit_count=1,
+        first_visit_at=T1,
+        last_visit_at=T1,
+        profile=profile,
+    )
+    merged: dict[str, UrlSubmission] = {}
+
+    _merge_record(merged, newer)
+    _merge_record(merged, older)
+
+    assert merged[url].title == "Older title"
+    assert merged[url].last_visit_at == T2
+
+
 @respx.mock(base_url=BASE)
 async def test_full_import_run(respx_mock, tmp_path):
     pages_route = mock_api(respx_mock)
@@ -119,7 +168,7 @@ async def test_full_import_run(respx_mock, tmp_path):
 
     async with StateStore(config.state.db_path) as state:
         counts = await state.status_counts()
-        times = await state.load_submission_times()
+        times = await state.load_submission_visit_times()
         watermark = await state.get_watermark(profiles[0])
     assert counts.get("indexed") == 2
     assert counts.get("blacklisted") == 1
@@ -140,6 +189,132 @@ async def test_second_run_is_incremental(respx_mock, tmp_path):
     # Watermarks advanced: nothing new to read, nothing re-submitted.
     assert second.total_to_submit == 0
     assert second.submitted == 0
+
+
+@respx.mock(base_url=BASE)
+async def test_limited_run_leaves_watermarks_for_remaining_urls(respx_mock, tmp_path):
+    mock_api(respx_mock)
+    config = make_config(tmp_path)
+    profiles = make_profiles(tmp_path)
+
+    first = await run_import(
+        config=config, profiles=profiles, console=quiet_console(), limit=1
+    )
+    assert first.total_to_submit == 1
+    async with StateStore(config.state.db_path) as state:
+        assert await state.get_watermark(profiles[0]) is None
+        assert await state.get_watermark(profiles[1]) is None
+
+    second = await run_import(config=config, profiles=profiles, console=quiet_console())
+    assert second.total_to_submit == 2
+    assert second.accepted == 1
+    assert second.blacklisted == 1
+
+
+@respx.mock(base_url=BASE)
+async def test_revisit_uses_last_observed_visit_time(respx_mock, tmp_path):
+    pages_route = mock_api(respx_mock)
+    config = make_config(tmp_path)
+    config.import_.resubmit_revisits = True
+    db = tmp_path / "History"
+    url = "https://revisited.example/"
+    make_chromium_db(db, [(url, "Revisited", [T0], 0)])
+    profile = profile_for(db, BrowserFamily.CHROMIUM)
+
+    first = await run_import(config=config, profiles=[profile], console=quiet_console())
+    assert first.accepted == 1
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute(
+            "INSERT INTO visits (url, visit_time) VALUES (?, ?)",
+            (1, to_chromium_us(T1)),
+        )
+        conn.commit()
+
+    second = await run_import(
+        config=config, profiles=[profile], console=quiet_console()
+    )
+    assert second.total_to_submit == 1
+    assert second.accepted == 1
+    assert len(pages_route.calls) == 2
+    async with StateStore(config.state.db_path) as state:
+        observed = await state.load_submission_visit_times()
+    assert observed[url] == T1
+
+
+@respx.mock(base_url=BASE, assert_all_called=False)
+async def test_task_group_unwraps_auth_error(respx_mock, tmp_path):
+    respx_mock.get("/readyz").respond(200, json={"status": "ready"})
+    respx_mock.get("/v1/jobs").respond(200, json={"jobs": []})
+    respx_mock.post("/v1/pages").respond(
+        401, json={"detail": "missing or invalid bearer token"}
+    )
+    config = make_config(tmp_path)
+    config.import_.resubmit_revisits = True
+    db = tmp_path / "History"
+    make_chromium_db(db, [("https://auth.example/", "Auth", [T0], 0)])
+
+    with pytest.raises(AuthError):
+        await run_import(
+            config=config,
+            profiles=[profile_for(db, BrowserFamily.CHROMIUM)],
+            console=quiet_console(),
+        )
+
+
+@respx.mock(base_url=BASE, assert_all_called=False)
+async def test_validation_rejection_is_terminal_and_not_retried(respx_mock, tmp_path):
+    respx_mock.get("/readyz").respond(200, json={"status": "ready"})
+    respx_mock.get("/v1/jobs").respond(200, json={"jobs": []})
+    pages_route = respx_mock.post("/v1/pages").respond(
+        422, json={"detail": "URL is not ingestible"}
+    )
+    config = make_config(tmp_path)
+    db = tmp_path / "History"
+    url = "https://rejected.example/"
+    make_chromium_db(db, [(url, "Rejected", [T0], 0)])
+    profile = profile_for(db, BrowserFamily.CHROMIUM)
+
+    first = await run_import(config=config, profiles=[profile], console=quiet_console())
+
+    assert first.submitted == 1
+    assert first.rejected == 1
+    assert first.errors == 0
+    assert first.processed == 1
+    async with StateStore(config.state.db_path) as state:
+        counts = await state.status_counts()
+        watermark = await state.get_watermark(profile)
+    assert counts["rejected"] == 1
+    assert watermark == T0
+    with closing(sqlite3.connect(config.state.db_path)) as conn:
+        run_row = conn.execute(
+            "SELECT interrupted, rejected, errors FROM runs WHERE id = 1"
+        ).fetchone()
+        submission_row = conn.execute(
+            "SELECT outcome, last_error FROM submissions WHERE url = :url",
+            {"url": url},
+        ).fetchone()
+    assert run_row == (0, 1, 0)
+    assert submission_row == (
+        "rejected",
+        "server rejected the request: URL is not ingestible",
+    )
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute(
+            "INSERT INTO visits (url, visit_time) VALUES (?, ?)",
+            (1, to_chromium_us(T1)),
+        )
+        conn.commit()
+
+    second = await run_import(
+        config=config,
+        profiles=[profile],
+        console=quiet_console(),
+        ignore_watermarks=True,
+    )
+
+    assert second.total_to_submit == 0
+    assert second.already_submitted == 1
+    assert len(pages_route.calls) == 1
 
 
 @respx.mock(base_url=BASE, assert_all_called=False)

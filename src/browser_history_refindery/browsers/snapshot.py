@@ -45,4 +45,4 @@ def history_snapshot(db_path: Path) -> Generator[Path]:
 
 def open_readonly(db_path: Path) -> sqlite3.Connection:
     """Open a SQLite database in read-only mode."""
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    return sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)

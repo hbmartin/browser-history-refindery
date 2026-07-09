@@ -133,7 +133,7 @@ def _merge_record(merged: dict[str, UrlSubmission], record: VisitRecord) -> None
         return
     newest = record.last_visit_at > existing.last_visit_at
     existing.sources.append(source)
-    if newest and record.title:
+    if record.title and (newest or not existing.title):
         existing.title = record.title
 
 
@@ -164,18 +164,21 @@ async def _build_plan(
             _merge_record(merged, record)
         if records:
             watermarks[profile] = max(record.last_visit_at for record in records)
-    submitted = await state.load_submission_times()
+    submitted = await state.load_submission_visit_times()
+    permanently_rejected = await state.load_rejected_urls()
     keep, skips = _filter_merged(
         merged,
         submitted=submitted,
+        permanently_rejected=permanently_rejected,
         engine=engine,
         stats=stats,
         resubmit_revisits=config.import_.resubmit_revisits,
     )
     await state.record_skips(skips, run_id)
     keep.sort(key=lambda submission: submission.last_visit_at, reverse=True)
-    if limit is not None:
+    if limit is not None and len(keep) > limit:
         keep = keep[:limit]
+        watermarks = {}
     stats.total_to_submit = len(keep)
     for submission in keep:
         if profile_stats := stats.per_profile.get(submission.primary.profile_key):
@@ -187,6 +190,7 @@ def _filter_merged(
     merged: dict[str, UrlSubmission],
     *,
     submitted: dict[str, datetime],
+    permanently_rejected: set[str],
     engine: ExclusionEngine,
     stats: RunStats,
     resubmit_revisits: bool,
@@ -194,6 +198,9 @@ def _filter_merged(
     keep: list[UrlSubmission] = []
     skips: list[tuple[str, SkipReason]] = []
     for url, submission in merged.items():
+        if url in permanently_rejected:
+            stats.already_submitted += 1
+            continue
         if (prior := submitted.get(url)) is not None and (
             not resubmit_revisits or submission.last_visit_at <= prior
         ):
@@ -257,8 +264,19 @@ class _Runner:
             self._handle_submit_error(item, exc)
             return
         except ValidationRejectedError as exc:
-            self.stats.errors += 1
+            self.pacer.on_success()
+            self.stats.submitted += 1
+            self.stats.rejected += 1
+            if profile_stats := self.stats.per_profile.get(item.primary.profile_key):
+                profile_stats.submitted += 1
             self.stats.add_event(f"rejected {_short(item.url)}: {exc}")
+            await self.state.record_submission(
+                url=item.url,
+                outcome="rejected",
+                run_id=self.run_id,
+                last_visit_at=item.last_visit_at,
+                last_error=str(exc),
+            )
             return
         self.pacer.on_success()
         self.stats.submitted += 1
@@ -276,6 +294,7 @@ class _Runner:
                     url=item.url,
                     outcome="queued",
                     run_id=self.run_id,
+                    last_visit_at=item.last_visit_at,
                     page_id=page_id,
                     server_status="queued",
                 )
@@ -287,6 +306,7 @@ class _Runner:
                     url=item.url,
                     outcome="revisit",
                     run_id=self.run_id,
+                    last_visit_at=item.last_visit_at,
                     page_id=page_id,
                     server_status=status,
                 )
@@ -296,7 +316,10 @@ class _Runner:
                     f"blacklisted by server ({pattern}): {_short(item.url)}"
                 )
                 await self.state.record_submission(
-                    url=item.url, outcome="blacklisted", run_id=self.run_id
+                    url=item.url,
+                    outcome="blacklisted",
+                    run_id=self.run_id,
+                    last_visit_at=item.last_visit_at,
                 )
 
     def _handle_submit_error(self, item: UrlSubmission, exc: Exception) -> None:
@@ -365,6 +388,17 @@ class _Runner:
             await self.interruptible_sleep(self.config.pacing.queue_poll_interval)
 
 
+def _runtime_error_from_group(group: ExceptionGroup) -> RuntimeError | None:
+    """Return the first leaf when every grouped failure is a RuntimeError."""
+    runtime_errors, remainder = group.split(RuntimeError)
+    if runtime_errors is None or remainder is not None:
+        return None
+    error: BaseException = runtime_errors
+    while isinstance(error, BaseExceptionGroup):
+        error = error.exceptions[0]
+    return error if isinstance(error, RuntimeError) else None
+
+
 async def _run_tasks(runner: _Runner, plan: ImportPlan, console: Console) -> bool:
     """Run submitter, poller, backlog watcher, and the live UI. True if interrupted."""
     for item in plan.submissions:
@@ -398,10 +432,15 @@ async def _run_tasks(runner: _Runner, plan: ImportPlan, console: Console) -> boo
 
             refresh_task = asyncio.create_task(refresh())
             try:
-                async with asyncio.TaskGroup() as tg:
-                    tasks.append(tg.create_task(runner.submitter()))
-                    tasks.append(tg.create_task(runner.poller()))
-                    tasks.append(tg.create_task(runner.backlog_watcher()))
+                try:
+                    async with asyncio.TaskGroup() as tg:
+                        tasks.append(tg.create_task(runner.submitter()))
+                        tasks.append(tg.create_task(runner.poller()))
+                        tasks.append(tg.create_task(runner.backlog_watcher()))
+                except ExceptionGroup as exc:
+                    if error := _runtime_error_from_group(exc):
+                        raise error from exc
+                    raise
             finally:
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -478,6 +517,7 @@ async def run_import(
                 submitted=stats.accepted,
                 revisits=stats.revisits,
                 blacklisted=stats.blacklisted,
+                rejected=stats.rejected,
                 skipped=stats.skipped,
                 errors=stats.errors,
             )
