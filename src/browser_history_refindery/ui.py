@@ -80,12 +80,10 @@ def _counters_table(stats: RunStats) -> Table:
         "server backlog",
         backlog,
     )
-    table.add_row(
-        "skipped locally",
-        f"[dim]{stats.skipped + stats.already_submitted}[/]",
-        "",
-        "",
+    skipped_locally = (
+        stats.skipped + stats.already_submitted + stats.previously_rejected
     )
+    table.add_row("skipped locally", f"[dim]{skipped_locally}[/]", "", "")
     table.add_row("interval", f"{stats.current_interval:.2f}s", "", "")
     return table
 
@@ -136,6 +134,7 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
     table.add_row("server-rejected", str(stats.rejected))
     table.add_row("skipped (rules)", str(stats.skipped))
     table.add_row("already submitted", str(stats.already_submitted))
+    table.add_row("previously rejected", str(stats.previously_rejected))
     table.add_row("errors", str(stats.errors))
     table.add_row("indexed so far", str(stats.indexed))
     table.add_row("dead", str(stats.dead))
@@ -162,6 +161,7 @@ def print_dry_run_report(
     table.add_column(justify="right")
     table.add_row("would submit", str(stats.total_to_submit))
     table.add_row("already submitted", str(stats.already_submitted))
+    table.add_row("previously rejected", str(stats.previously_rejected))
     table.add_row("skipped by rules", str(stats.skipped))
     console.print(table)
     for kind, count in stats.skip_reasons.most_common():

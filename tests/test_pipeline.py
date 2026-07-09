@@ -26,6 +26,7 @@ from tests.conftest import (
     T1,
     T2,
     make_chromium_db,
+    make_firefox_db,
     make_safari_db,
     profile_for,
 )
@@ -212,6 +213,35 @@ async def test_limited_run_leaves_watermarks_for_remaining_urls(respx_mock, tmp_
 
 
 @respx.mock(base_url=BASE)
+async def test_limited_run_keeps_watermarks_for_fully_submitted_profiles(
+    respx_mock, tmp_path
+):
+    mock_api(respx_mock)
+    config = make_config(tmp_path)
+    old_db = tmp_path / "old-History"
+    make_chromium_db(old_db, [("https://old.example/", "Old", [T0], 0)])
+    new_db = tmp_path / "new-places.sqlite"
+    make_firefox_db(new_db, [("https://new.example/", "New", [T1], 0)])
+    old_profile = profile_for(old_db, BrowserFamily.CHROMIUM)
+    new_profile = profile_for(new_db, BrowserFamily.FIREFOX)
+
+    stats = await run_import(
+        config=config,
+        profiles=[old_profile, new_profile],
+        console=quiet_console(),
+        limit=1,
+    )
+
+    # The newest URL (firefox) made the cut, so only the chromium profile —
+    # whose URL was dropped — must be re-read on the next run.
+    assert stats.total_to_submit == 1
+    assert stats.accepted == 1
+    async with StateStore(config.state.db_path) as state:
+        assert await state.get_watermark(old_profile) is None
+        assert await state.get_watermark(new_profile) == T1
+
+
+@respx.mock(base_url=BASE)
 async def test_revisit_uses_last_observed_visit_time(respx_mock, tmp_path):
     pages_route = mock_api(respx_mock)
     config = make_config(tmp_path)
@@ -313,7 +343,8 @@ async def test_validation_rejection_is_terminal_and_not_retried(respx_mock, tmp_
     )
 
     assert second.total_to_submit == 0
-    assert second.already_submitted == 1
+    assert second.previously_rejected == 1
+    assert second.already_submitted == 0
     assert len(pages_route.calls) == 1
 
 

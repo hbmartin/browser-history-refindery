@@ -177,8 +177,19 @@ async def _build_plan(
     await state.record_skips(skips, run_id)
     keep.sort(key=lambda submission: submission.last_visit_at, reverse=True)
     if limit is not None and len(keep) > limit:
+        # Profiles whose URLs were cut must be re-read next run, so their
+        # watermarks must not advance; the submissions table dedups the rest.
+        dropped_keys = {
+            source.profile_key
+            for submission in keep[limit:]
+            for source in submission.sources
+        }
         keep = keep[:limit]
-        watermarks = {}
+        watermarks = {
+            profile: watermark
+            for profile, watermark in watermarks.items()
+            if profile.key not in dropped_keys
+        }
     stats.total_to_submit = len(keep)
     for submission in keep:
         if profile_stats := stats.per_profile.get(submission.primary.profile_key):
@@ -199,7 +210,7 @@ def _filter_merged(
     skips: list[tuple[str, SkipReason]] = []
     for url, submission in merged.items():
         if url in permanently_rejected:
-            stats.already_submitted += 1
+            stats.previously_rejected += 1
             continue
         if (prior := submitted.get(url)) is not None and (
             not resubmit_revisits or submission.last_visit_at <= prior

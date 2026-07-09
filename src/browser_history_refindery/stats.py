@@ -31,6 +31,7 @@ class RunStats:
     rejected: int = 0
     skipped: int = 0
     already_submitted: int = 0
+    previously_rejected: int = 0
     errors: int = 0
     indexed: int = 0
     dead: int = 0

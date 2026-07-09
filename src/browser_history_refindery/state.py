@@ -69,6 +69,17 @@ def _now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
+class StateSchemaTooNewError(RuntimeError):
+    """The state database was written by a newer version of this tool."""
+
+    def __init__(self, version: int) -> None:
+        super().__init__(
+            f"state database schema is v{version} but this build supports up to "
+            f"v{SCHEMA_VERSION}; upgrade refindery-import or point state.db_path "
+            "at a different file"
+        )
+
+
 class StateStore:
     """Async wrapper around the local progress-tracking database."""
 
@@ -99,6 +110,11 @@ class StateStore:
         """Open the database, creating the schema on first use."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(self._db_path)
+        cursor = await conn.execute("PRAGMA user_version")
+        version = int(row[0]) if (row := await cursor.fetchone()) else 0
+        if version > SCHEMA_VERSION:
+            await conn.close()
+            raise StateSchemaTooNewError(version)
         await conn.execute("PRAGMA journal_mode = WAL")
         await conn.execute("PRAGMA foreign_keys = ON")
         await conn.executescript(_SCHEMA)
