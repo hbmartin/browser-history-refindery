@@ -3,6 +3,7 @@
 import io
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from rich.console import Console
@@ -84,7 +85,8 @@ def test_configure_is_idempotent(tmp_path: Path) -> None:
     config = LoggingConfig(enabled=True, path=log_path, level="INFO")
     configure_logging(config)
     configure_logging(config)  # must not stack duplicate sinks
-    assert len(logger._core.handlers) == 1  # noqa: SLF001 - inspecting loguru state
+    loguru_core = cast("Any", logger)._core  # noqa: SLF001 - inspecting loguru state
+    assert len(loguru_core.handlers) == 1
 
 
 def test_config_uses_logging_section(tmp_path: Path) -> None:

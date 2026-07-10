@@ -1,6 +1,7 @@
 """Profile selection, the live import dashboard, and end-of-run reports."""
 
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import Protocol
 
 import questionary
 from rich.console import Console, Group, RenderableType
@@ -19,8 +20,11 @@ from rich.table import Table
 from browser_history_refindery.browsers import BrowserProfile
 from browser_history_refindery.stats import RunStats
 
-if TYPE_CHECKING:
-    from browser_history_refindery.pipeline import UrlSubmission
+
+class UrlDisplay(Protocol):
+    """URL-bearing value accepted by dry-run reporting."""
+
+    url: str
 
 
 def select_profiles(profiles: list[BrowserProfile]) -> list[BrowserProfile]:
@@ -214,7 +218,7 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
 
 
 def print_dry_run_report(
-    console: Console, stats: RunStats, submissions: list["UrlSubmission"]
+    console: Console, stats: RunStats, submissions: Sequence[UrlDisplay]
 ) -> None:
     """Print what an import run would do, without submitting anything."""
     console.print("\n[bold]Dry run[/] — nothing was submitted.\n")
