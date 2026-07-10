@@ -565,6 +565,53 @@ async def test_submit_persists_the_attempted_snapshot(tmp_path: Path) -> None:
     assert runner.stats.total_to_submit == 1
 
 
+async def test_submitter_rejects_duplicate_queueing_and_restores_reserved_item(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    merged: dict[str, UrlSubmission] = {}
+    _merge_record(
+        merged,
+        VisitRecord(
+            url="https://reserved.example/",
+            title="Reserved",
+            visit_count=1,
+            first_visit_at=T0,
+            last_visit_at=T0,
+            profile=profile,
+        ),
+    )
+    item = merged["https://reserved.example/"]
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        runner = _Runner(
+            client=cast("Any", object()),
+            state=state,
+            stats=RunStats(),
+            config=config,
+            run_id=run_id,
+            profiles=[],
+            engine=ExclusionEngine(config.exclusions),
+            ignore_watermarks=False,
+            limit=None,
+        )
+        assert runner._enqueue(item) is True  # noqa: SLF001 - queue-state regression
+        assert runner._enqueue(item) is False  # noqa: SLF001 - queue-state regression
+
+        async def stop_after_reservation() -> None:
+            runner.shutdown.set()
+
+        cast("Any", runner.pacer).wait = stop_after_reservation
+        await runner.submitter()
+
+    assert runner.queue.qsize() == 1
+    assert runner.queue.get_nowait() is item
+    assert item.queued is True
+    assert runner.stats.submitter_finished is True
+
+
 async def test_submit_requeues_on_revisit_when_newer_visit_appears(
     tmp_path: Path,
 ) -> None:

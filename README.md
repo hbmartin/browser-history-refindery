@@ -1,5 +1,13 @@
 # browser-history-refindery
 
+[![Lint and Test](https://github.com/hbmartin/browser-history-refindery/actions/workflows/lint-test.yml/badge.svg)](https://github.com/hbmartin/browser-history-refindery/actions/workflows/lint-test.yml)
+[![Security](https://github.com/hbmartin/browser-history-refindery/actions/workflows/security.yml/badge.svg)](https://github.com/hbmartin/browser-history-refindery/actions/workflows/security.yml)
+[![Documentation](https://github.com/hbmartin/browser-history-refindery/actions/workflows/docs.yml/badge.svg)](https://hbmartin.github.io/browser-history-refindery/)
+[![PyPI version](https://img.shields.io/pypi/v/browser-history-refindery.svg)](https://pypi.org/project/browser-history-refindery/)
+[![Python versions](https://img.shields.io/pypi/pyversions/browser-history-refindery.svg)](https://pypi.org/project/browser-history-refindery/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/hbmartin/browser-history-refindery/blob/main/LICENSE.txt)
+[![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
 Import macOS browser history into a
 [Refindery](https://github.com/hbmartin/refindery) backend.
 
