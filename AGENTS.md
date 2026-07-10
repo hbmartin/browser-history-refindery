@@ -36,7 +36,7 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 - Epoch conversions: Chromium = µs since 1601-01-01 (offset 11_644_473_600 s from Unix), Firefox = µs since Unix epoch, Safari = float seconds since 2001-01-01 (offset 978_307_200 s). Golden tests in `tests/test_times.py`.
 
 ## Gotchas / learnings
-- respx's `@respx.mock(base_url=...)` decorator injects the router as an argument that pytest resolves as the `respx_mock` fixture — the test parameter MUST be named `respx_mock`, not `router`. Tests that intentionally make no HTTP calls need `assert_all_called=False`.
+- HTTP tests use `httpx2-pytest`'s `httpx2_mock` fixture so the old `httpx` package is not retained through `respx`. Responses are single-use unless registered with `is_reusable=True`; concurrent or dry-run endpoints that may not be called need `is_optional=True`.
 - ruff `ASYNC109` bans a `timeout` parameter on async functions — pass timeouts via constructor/config instead.
 - ruff `TRY003`/`EM102`: put exception messages inside custom exception classes' `__init__` (e.g. `FullDiskAccessError`, `AuthError`) instead of at raise sites.
 - Safari titles live on `history_visits`, not `history_items`; the reader uses an explicit newest-visit subquery while separately aggregating `MIN` and `MAX` visit times.
@@ -50,4 +50,5 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 - `config.toml` and `refindery_state.sqlite3*` are gitignored (the config holds the bearer token).
 - The default-config template is a hand-commented string constant (`DEFAULT_CONFIG_TOML`) kept in sync with the pydantic defaults — `test_first_run_writes_template` verifies it parses back to `AppConfig()`.
 - `BrowserProfile.key` is the readable `browser_id:profile_dir` stats key and can collide across distinct history paths; use the path-aware `BrowserProfile.watermark_key` for persisted watermark lookups and `--limit` pruning. Watermark tests should use same-family profiles with the same profile directory name to cover collisions explicitly.
+- Persisted path-based identities must normalize with `Path.resolve()` before stringification so equivalent relative and absolute history paths cannot create duplicate watermark rows.
 - Safari incremental reads limit visit aggregates to the post-watermark window, but title fallback must search the URL's full visit history so an untitled revisit can reuse an older title.

@@ -35,7 +35,7 @@ Update CLAUDE.md with notes, learnings, findings, or other useful patters you ha
 - Epoch conversions: Chromium = µs since 1601-01-01 (offset 11_644_473_600 s from Unix), Firefox = µs since Unix epoch, Safari = float seconds since 2001-01-01 (offset 978_307_200 s). Golden tests in `tests/test_times.py`.
 
 ## Gotchas / learnings
-- respx's `@respx.mock(base_url=...)` decorator injects the router as an argument that pytest resolves as the `respx_mock` fixture — the test parameter MUST be named `respx_mock`, not `router`. Tests that intentionally make no HTTP calls need `assert_all_called=False`.
+- HTTP tests use `httpx2-pytest`'s `httpx2_mock` fixture so the old `httpx` package is not retained through `respx`. Responses are single-use unless registered with `is_reusable=True`; concurrent or dry-run endpoints that may not be called need `is_optional=True`.
 - ruff `ASYNC109` bans a `timeout` parameter on async functions — pass timeouts via constructor/config instead.
 - ruff `TRY003`/`EM102`: put exception messages inside custom exception classes' `__init__` (e.g. `FullDiskAccessError`, `AuthError`) instead of at raise sites.
 - Safari titles live on `history_visits`, not `history_items`; the reader relies on SQLite's bare-column-with-lone-MAX guarantee to pick the newest visit's title.

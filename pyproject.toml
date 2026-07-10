@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
-    "httpx>=0.28.1",
+    "httpx2>=2.2.0",
     "pydantic>=2.13.4",
     "questionary>=2.1.1",
     "rich>=15.0.0",
@@ -30,9 +30,12 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "respx>=0.23.1",
+    "httpx2-pytest>=1.0.1",
     "ruff>=0.15.20",
     "ty>=0.0.57",
+]
+docs = [
+    "mkdocstrings-python>=2.0.5",
 ]
 
 [tool.pyrefly]
