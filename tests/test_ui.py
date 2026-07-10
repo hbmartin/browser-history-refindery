@@ -86,7 +86,7 @@ def test_dry_run_report_lists_urls():
             self.url = url
 
     submissions = [_Sub(f"https://example.com/{index}") for index in range(12)]
-    print_dry_run_report(console, _populated_stats(), submissions)  # type: ignore[arg-type]
+    print_dry_run_report(console, _populated_stats(), submissions)
     output = buffer.getvalue()
     assert "Dry run" in output
     assert "and 2 more" in output  # 12 submissions, first 10 shown

@@ -6,6 +6,7 @@ from contextlib import closing
 
 import pytest
 
+from browser_history_refindery.browsers import snapshot
 from browser_history_refindery.browsers.snapshot import (
     FullDiskAccessError,
     history_snapshot,
@@ -34,6 +35,7 @@ def test_permission_error_maps_to_fda(tmp_path, monkeypatch):
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(shutil, "copy2", deny)
+    monkeypatch.setattr(snapshot.sys, "platform", "darwin")
     with (
         pytest.raises(FullDiskAccessError, match="Full Disk Access"),
         history_snapshot(db),

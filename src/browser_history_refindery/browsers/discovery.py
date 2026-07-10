@@ -273,7 +273,7 @@ def _discover_linux(root: Path) -> list[BrowserProfile]:
 
 
 def discover_all(
-    home: Path | None = None, *, platform_name: str = sys.platform
+    home: Path | None = None, *, platform_name: str | None = None
 ) -> list[BrowserProfile]:
     """Discover every browser profile with history on this machine.
 
@@ -282,7 +282,9 @@ def discover_all(
     """
     root = home if home is not None else Path.home()
     profiles: list[BrowserProfile] = []
-    match _detect_platform(platform_name):
+    match _detect_platform(
+        platform_name if platform_name is not None else sys.platform
+    ):
         case Platform.MACOS:
             profiles = _discover_macos(root)
         case Platform.LINUX:

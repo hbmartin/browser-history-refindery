@@ -5,6 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from browser_history_refindery import __version__
+from browser_history_refindery.browsers import discovery
 from browser_history_refindery.cli import app
 
 runner = CliRunner()
@@ -25,6 +26,7 @@ def test_help_lists_subcommands():
 
 def test_list_profiles(fake_home, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(discovery.sys, "platform", "darwin")
     result = runner.invoke(app, ["list-profiles"])
     assert result.exit_code == 0
     assert "Harold" in result.output
@@ -33,6 +35,7 @@ def test_list_profiles(fake_home, monkeypatch):
 
 def test_import_dry_run(fake_home, tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(discovery.sys, "platform", "darwin")
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         f"""

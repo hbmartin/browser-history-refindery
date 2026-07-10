@@ -7,20 +7,25 @@ import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import Any, cast
 
 import httpx2
 import pytest
 from pytest_httpx2 import HTTPXMock
 from rich.console import Console
 
-from browser_history_refindery.api_client import AuthError
+from browser_history_refindery.api_client import Accepted, AuthError
+from browser_history_refindery.api_models import IngestPageRequest
 from browser_history_refindery.browsers import BrowserFamily
 from browser_history_refindery.browsers.base import VisitRecord, to_chromium_us
 from browser_history_refindery.config import AppConfig
 from browser_history_refindery.filters import ExclusionEngine
 from browser_history_refindery.pipeline import (
     UrlSubmission,
+    _log_url,
     _merge_record,
+    _Planner,
+    _Runner,
     _runtime_error_from_group,
     _stream_profiles,
     run_import,
@@ -206,6 +211,81 @@ def test_merge_uses_older_nonempty_title_as_fallback(tmp_path):
     assert merged[url].last_visit_at == T2
 
 
+def test_merge_profile_deduplicates_touched_urls(tmp_path: Path) -> None:
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    url = "https://duplicate.example/page?version=1"
+    records = [
+        VisitRecord(
+            url=url,
+            title="First",
+            visit_count=1,
+            first_visit_at=T0,
+            last_visit_at=visited_at,
+            profile=profile,
+        )
+        for visited_at in (T0, T1)
+    ]
+    planner = _Planner(
+        engine=ExclusionEngine(AppConfig().exclusions),
+        stats=RunStats(),
+        submitted={},
+        permanently_rejected=set(),
+        resubmit_revisits=False,
+    )
+
+    _, touched = planner.merge_profile(records)
+    _, enqueue = planner.classify_profile(touched)
+
+    assert touched == [url]
+    assert enqueue == [url]
+
+
+def test_merge_profile_keeps_query_variants_distinct(tmp_path: Path) -> None:
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    urls = [
+        "https://queries.example/page?version=1",
+        "https://queries.example/page?version=2",
+    ]
+    records = [
+        VisitRecord(
+            url=url,
+            title="Versioned",
+            visit_count=1,
+            first_visit_at=T0,
+            last_visit_at=T0,
+            profile=profile,
+        )
+        for url in urls
+    ]
+    planner = _Planner(
+        engine=ExclusionEngine(AppConfig().exclusions),
+        stats=RunStats(),
+        submitted={},
+        permanently_rejected=set(),
+        resubmit_revisits=False,
+    )
+
+    _, touched = planner.merge_profile(records)
+    _, enqueue = planner.classify_profile(touched)
+
+    assert set(touched) == set(urls)
+    assert set(enqueue) == set(urls)
+    assert set(planner.merged) == set(urls)
+
+
+def test_log_url_hides_query_but_preserves_distinct_fingerprints() -> None:
+    first = "https://example.test/page?token=secret-one#private"
+    second = "https://example.test/page?token=secret-two#private"
+
+    first_display = _log_url(first)
+    second_display = _log_url(second)
+
+    assert first_display.startswith("https://example.test/page?redacted=")
+    assert "secret-one" not in first_display
+    assert "private" not in first_display
+    assert first_display != second_display
+
+
 async def test_full_import_run(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
     mock_api(httpx2_mock)
     config = make_config(tmp_path)
@@ -335,6 +415,111 @@ async def test_revisit_uses_last_observed_visit_time(
     async with StateStore(config.state.db_path) as state:
         observed = await state.load_submission_visit_times()
     assert observed[url] == T1
+
+
+async def test_shared_url_reconsiders_later_profile_revisit(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.import_.resubmit_revisits = True
+    url = "https://cross-profile-revisit.example/"
+    older_db = tmp_path / "older-History"
+    make_chromium_db(older_db, [(url, "Older", [T0], 0)])
+    newer_db = tmp_path / "newer-History"
+    make_chromium_db(newer_db, [(url, "Newer", [T2], 0)])
+    profiles = [
+        profile_for(older_db, BrowserFamily.CHROMIUM),
+        profile_for(newer_db, BrowserFamily.CHROMIUM),
+    ]
+    collected: list[UrlSubmission] = []
+    stats = RunStats()
+
+    async def collect(submission: UrlSubmission) -> None:
+        collected.append(submission)
+
+    async with StateStore(config.state.db_path) as state:
+        prior_run_id = await state.begin_run()
+        await state.record_submission(
+            url=url,
+            outcome="queued",
+            run_id=prior_run_id,
+            last_visit_at=T1,
+            page_id="pg_prior",
+            server_status="indexed",
+        )
+        run_id = await state.begin_run()
+        await _stream_profiles(
+            profiles,
+            engine=ExclusionEngine(config.exclusions),
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=False,
+            limit=None,
+            shutdown=asyncio.Event(),
+            emit=collect,
+        )
+
+    assert len(collected) == 1
+    assert collected[0].last_visit_at == T2
+    assert stats.already_submitted == 0
+    assert stats.total_to_submit == 1
+
+
+async def test_submit_persists_the_attempted_snapshot(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.import_.resubmit_revisits = True
+    url = "https://in-flight-merge.example/"
+    first_profile = profile_for(tmp_path / "first-History", BrowserFamily.CHROMIUM)
+    later_profile = profile_for(tmp_path / "later-History", BrowserFamily.SAFARI)
+    initial = VisitRecord(
+        url=url,
+        title="Initial",
+        visit_count=1,
+        first_visit_at=T0,
+        last_visit_at=T0,
+        profile=first_profile,
+    )
+    later = VisitRecord(
+        url=url,
+        title="Later",
+        visit_count=1,
+        first_visit_at=T2,
+        last_visit_at=T2,
+        profile=later_profile,
+    )
+    merged: dict[str, UrlSubmission] = {}
+    _merge_record(merged, initial)
+    item = merged[url]
+    attempted_requests: list[IngestPageRequest] = []
+
+    class MutatingClient:
+        async def ingest_url(self, request: IngestPageRequest) -> Accepted:
+            attempted_requests.append(request)
+            _merge_record(merged, later)
+            await asyncio.sleep(0)
+            return Accepted(page_id="pg_snapshot")
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        runner = _Runner(
+            client=cast("Any", MutatingClient()),
+            state=state,
+            stats=RunStats(),
+            config=config,
+            run_id=run_id,
+            profiles=[],
+            engine=ExclusionEngine(config.exclusions),
+            ignore_watermarks=False,
+            limit=None,
+        )
+        await runner._submit_one(item)  # noqa: SLF001 - targeted runner regression
+        observed = await state.load_submission_visit_times()
+
+    assert attempted_requests[0].fetched_at == T0
+    assert item.last_visit_at == T2
+    assert observed[url] == T0
+    assert runner.queue.get_nowait() is item
+    assert runner.stats.total_to_submit == 1
 
 
 async def test_task_group_unwraps_auth_error(

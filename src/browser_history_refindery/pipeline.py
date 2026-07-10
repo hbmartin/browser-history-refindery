@@ -14,14 +14,16 @@ profiles must win the capped slots — there the merge is always complete.
 
 import asyncio
 import contextlib
+import hashlib
 import signal
 import socket
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Self
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx2
 from rich.console import Console
@@ -74,6 +76,11 @@ class UrlSubmission:
     title: str | None
     sources: list[SourceInfo] = field(default_factory=list)
     attempts: int = 0
+    last_submitted_visit_at: datetime | None = None
+
+    def snapshot(self) -> Self:
+        """Freeze the current merged shape for one HTTP attempt and its result."""
+        return replace(self, sources=list(self.sources))
 
     @property
     def primary(self) -> SourceInfo:
@@ -159,6 +166,18 @@ def _short(url: str, limit: int = 60) -> str:
     return url if len(url) <= limit else f"{url[: limit - 1]}…"
 
 
+def _log_url(url: str) -> str:
+    """Render a URL for logs without exposing query or fragment contents."""
+    parts = urlsplit(url)
+    sensitive = urlunsplit(("", "", "", parts.query, parts.fragment))
+    if not sensitive:
+        return url
+    fingerprint = hashlib.sha256(sensitive.encode()).hexdigest()[:12]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")) + (
+        f"?redacted={fingerprint}"
+    )
+
+
 def _classify(
     url: str,
     submission: UrlSubmission,
@@ -191,6 +210,48 @@ class _Planner:
     resubmit_revisits: bool
     merged: dict[str, UrlSubmission] = field(default_factory=dict)
     classified: set[str] = field(default_factory=set)
+    already: set[str] = field(default_factory=set)
+
+    def merge_profile(
+        self, records: list[VisitRecord]
+    ) -> tuple[datetime | None, list[str]]:
+        """Merge records and reconsider deduped URLs when a newer visit appears."""
+        profile_max: datetime | None = None
+        touched: list[str] = []
+        touched_urls: set[str] = set()
+        for record in records:
+            if profile_max is None or record.last_visit_at > profile_max:
+                profile_max = record.last_visit_at
+            _merge_record(self.merged, record)
+            if record.url in touched_urls:
+                continue
+            if record.url not in self.classified:
+                touched.append(record.url)
+                touched_urls.add(record.url)
+                continue
+            submission = self.merged[record.url]
+            if (
+                self.resubmit_revisits
+                and submission.last_submitted_visit_at is not None
+                and submission.last_visit_at > submission.last_submitted_visit_at
+            ):
+                self.classified.remove(record.url)
+                touched.append(record.url)
+                touched_urls.add(record.url)
+                continue
+            prior = self.submitted.get(record.url)
+            if (
+                self.resubmit_revisits
+                and record.url in self.already
+                and prior is not None
+                and self.merged[record.url].last_visit_at > prior
+            ):
+                self.classified.remove(record.url)
+                self.already.remove(record.url)
+                self.stats.already_submitted -= 1
+                touched.append(record.url)
+                touched_urls.add(record.url)
+        return profile_max, touched
 
     def classify_profile(
         self, touched: list[str]
@@ -222,6 +283,7 @@ class _Planner:
                 self.stats.skip_reasons[str(result.kind)] += 1
             elif result is Disposition.ALREADY:
                 self.stats.already_submitted += 1
+                self.already.add(url)
             elif result is Disposition.REJECTED:
                 self.stats.previously_rejected += 1
             else:
@@ -255,9 +317,7 @@ async def _read_profile_into(
     pstats.urls_read += len(records)
     stats.urls_read_total += len(records)
     logger.debug("read {} urls from {}", len(records), profile.display)
-    profile_max, touched = _merge_profile(
-        planner.merged, records, classified=planner.classified
-    )
+    profile_max, touched = planner.merge_profile(records)
     stats.unique_urls = len(planner.merged)
     skips, enqueue = planner.classify_profile(touched)
     if skips:
@@ -399,24 +459,6 @@ async def _emit_limited(
     }
 
 
-def _merge_profile(
-    merged: dict[str, UrlSubmission],
-    records: list[VisitRecord],
-    *,
-    classified: set[str],
-) -> tuple[datetime | None, list[str]]:
-    """Merge a profile's records; return its newest visit and unclassified URLs."""
-    profile_max: datetime | None = None
-    touched: list[str] = []
-    for record in records:
-        if profile_max is None or record.last_visit_at > profile_max:
-            profile_max = record.last_visit_at
-        _merge_record(merged, record)
-        if record.url not in classified:
-            touched.append(record.url)
-    return profile_max, touched
-
-
 class _Runner:
     """Shared context for the concurrent producer/submitter/poller/backlog tasks."""
 
@@ -501,8 +543,9 @@ class _Runner:
         return None
 
     async def _submit_one(self, item: UrlSubmission) -> None:
+        attempted = item.snapshot()
         try:
-            outcome = await self.client.ingest_url(item.to_request(self.hostname))
+            outcome = await self.client.ingest_url(attempted.to_request(self.hostname))
         except (httpx2.TransportError, ServerError) as exc:
             self._handle_submit_error(item, exc)
             return
@@ -510,23 +553,38 @@ class _Runner:
             self.pacer.on_success()
             self.stats.submitted += 1
             self.stats.rejected += 1
-            if profile_stats := self.stats.per_profile.get(item.primary.profile_key):
+            if profile_stats := self.stats.per_profile.get(
+                attempted.primary.profile_key
+            ):
                 profile_stats.submitted += 1
-            self.stats.add_event(f"rejected {_short(item.url)}: {exc}")
-            logger.info("rejected (422) {}: {}", item.url, exc)
+            display_url = _log_url(item.url)
+            self.stats.add_event(f"rejected {_short(display_url)}: {exc}")
+            logger.info("rejected (422) {}: {}", display_url, exc)
             await self.state.record_submission(
-                url=item.url,
+                url=attempted.url,
                 outcome="rejected",
                 run_id=self.run_id,
-                last_visit_at=item.last_visit_at,
+                last_visit_at=attempted.last_visit_at,
                 last_error=str(exc),
             )
             return
         self.pacer.on_success()
         self.stats.submitted += 1
-        if profile_stats := self.stats.per_profile.get(item.primary.profile_key):
+        if profile_stats := self.stats.per_profile.get(attempted.primary.profile_key):
             profile_stats.submitted += 1
-        await self._record_outcome(item, outcome)
+        await self._record_outcome(attempted, outcome)
+        if isinstance(outcome, Accepted | Revisit):
+            item.last_submitted_visit_at = attempted.last_visit_at
+            if (
+                self.config.import_.resubmit_revisits
+                and item.last_visit_at > attempted.last_visit_at
+            ):
+                self.queue.put_nowait(item)
+                self.stats.total_to_submit += 1
+                if profile_stats := self.stats.per_profile.get(
+                    item.primary.profile_key
+                ):
+                    profile_stats.queued_for_submit += 1
 
     async def _record_outcome(
         self, item: UrlSubmission, outcome: Accepted | Revisit | Blacklisted
@@ -534,7 +592,7 @@ class _Runner:
         match outcome:
             case Accepted(page_id=page_id):
                 self.stats.accepted += 1
-                logger.debug("accepted (202) {} -> {}", item.url, page_id)
+                logger.debug("accepted (202) {} -> {}", _log_url(item.url), page_id)
                 await self.state.record_submission(
                     url=item.url,
                     outcome="queued",
@@ -546,8 +604,15 @@ class _Runner:
             case Revisit(page_id=page_id, status=status) as revisit:
                 self.stats.revisits += 1
                 if revisit.content_hash_differs:
-                    self.stats.add_event(f"content changed: {_short(item.url)}")
-                logger.debug("revisit (200) {} -> {} ({})", item.url, page_id, status)
+                    self.stats.add_event(
+                        f"content changed: {_short(_log_url(item.url))}"
+                    )
+                logger.debug(
+                    "revisit (200) {} -> {} ({})",
+                    _log_url(item.url),
+                    page_id,
+                    status,
+                )
                 await self.state.record_submission(
                     url=item.url,
                     outcome="revisit",
@@ -559,9 +624,9 @@ class _Runner:
             case Blacklisted(pattern=pattern):
                 self.stats.blacklisted += 1
                 self.stats.add_event(
-                    f"blacklisted by server ({pattern}): {_short(item.url)}"
+                    f"blacklisted by server ({pattern}): {_short(_log_url(item.url))}"
                 )
-                logger.info("blacklisted (403) {} by {}", item.url, pattern)
+                logger.info("blacklisted (403) {} by {}", _log_url(item.url), pattern)
                 await self.state.record_submission(
                     url=item.url,
                     outcome="blacklisted",
@@ -574,22 +639,24 @@ class _Runner:
         item.attempts += 1
         if item.attempts >= self.config.pacing.max_attempts:
             self.stats.errors += 1
-            self.stats.add_event(f"gave up on {_short(item.url)}: {exc}")
+            display_url = _log_url(item.url)
+            self.stats.add_event(f"gave up on {_short(display_url)}: {exc}")
             logger.error(
-                "gave up on {} after {} attempts: {}", item.url, item.attempts, exc
+                "gave up on {} after {} attempts: {}", display_url, item.attempts, exc
             )
         else:
             self.stats.retries += 1
             self.queue.put_nowait(item)
+            display_url = _log_url(item.url)
             self.stats.add_event(
                 f"retry {item.attempts}/{self.config.pacing.max_attempts}: "
-                f"{_short(item.url)}"
+                f"{_short(display_url)}"
             )
             logger.warning(
                 "retry {}/{} {}: {}",
                 item.attempts,
                 self.config.pacing.max_attempts,
-                item.url,
+                display_url,
                 exc,
             )
 
