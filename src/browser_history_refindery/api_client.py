@@ -115,11 +115,14 @@ class RefinderyClient:
         deadline = time.monotonic() + self._ready_timeout
         while True:
             try:
-                response = await self._http.get("/readyz")
-                if response.status_code == HTTPStatus.OK:
-                    return
+                is_ready = (
+                    await self._http.get("/readyz")
+                ).status_code == HTTPStatus.OK
             except httpx2.TransportError:
-                pass
+                # A backend that has not bound its socket is not ready yet.
+                is_ready = False
+            if is_ready:
+                return
             if time.monotonic() >= deadline:
                 raise ReadyTimeoutError(self._ready_timeout)
             await asyncio.sleep(poll_interval)

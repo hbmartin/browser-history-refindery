@@ -157,11 +157,17 @@ async def test_wait_ready_times_out(httpx2_mock: HTTPXMock) -> None:
 
 
 async def test_pending_job_count(httpx2_mock: HTTPXMock) -> None:
-    httpx2_mock.add_response(
+    def check_request(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.path == "/v1/jobs"
+        assert dict(request.url.params) == {"status_filter": "pending", "limit": "10"}
+        return httpx2.Response(
+            status_code=200,
+            json={"jobs": [{"status": "pending"}, {"status": "pending"}]},
+        )
+
+    httpx2_mock.add_callback(
+        check_request,
         method="GET",
-        url=endpoint("/v1/jobs?status_filter=pending&limit=10"),
-        status_code=200,
-        json={"jobs": [{"status": "pending"}, {"status": "pending"}]},
     )
     async with make_client() as client:
         assert await client.pending_job_count(limit=10) == 2

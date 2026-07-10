@@ -37,6 +37,8 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 
 ## Gotchas / learnings
 - HTTP tests use `httpx2-pytest`'s `httpx2_mock` fixture so the old `httpx` package is not retained through `respx`. Responses are single-use unless registered with `is_reusable=True`; concurrent or dry-run endpoints that may not be called need `is_optional=True`.
+- For `httpx2_mock` query assertions, use a method-only callback, assert the request path and compare `dict(request.url.params)` so tests are independent of query-string serialization order.
+- In readiness polling, map expected transport failures to an explicit `is_ready = False`; this documents the intentional retry behavior and avoids empty exception handlers.
 - ruff `ASYNC109` bans a `timeout` parameter on async functions — pass timeouts via constructor/config instead.
 - ruff `TRY003`/`EM102`: put exception messages inside custom exception classes' `__init__` (e.g. `FullDiskAccessError`, `AuthError`) instead of at raise sites.
 - Safari titles live on `history_visits`, not `history_items`; the reader uses an explicit newest-visit subquery while separately aggregating `MIN` and `MAX` visit times.
