@@ -1,7 +1,7 @@
 [project]
 name = "browser-history-refindery"
 version = "0.1.0"
-description = "Add your description here"
+description = "Import macOS browser history into a Refindery backend"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -18,6 +18,7 @@ refindery-import = "browser_history_refindery.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/hbmartin/browser-history-refindery"
+Documentation = "https://hbmartin.github.io/browser-history-refindery/"
 Repository = "https://github.com/hbmartin/browser-history-refindery"
 Changelog = "https://github.com/hbmartin/browser-history-refindery/releases"
 
@@ -35,7 +36,7 @@ dev = [
     "ty>=0.0.57",
 ]
 docs = [
-    "mkdocstrings-python>=2.0.5",
+    "zensical>=0.0.47,<0.1",
 ]
 
 [tool.pyrefly]
