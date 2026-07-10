@@ -36,7 +36,7 @@ class BrowserProfile:
     @property
     def watermark_key(self) -> tuple[str, str]:
         """Persistent identity used for incremental-import watermarks."""
-        return self.browser_id, str(self.history_path)
+        return self.browser_id, str(self.history_path.resolve())
 
     @property
     def display(self) -> str:

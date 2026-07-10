@@ -9,6 +9,13 @@ which profiles to import, and submits each URL to Refindery's
 `POST /v1/pages` endpoint (URL-only mode; the server fetches and extracts
 content itself).
 
+## Refindery projects
+
+- **[Refindery](https://github.com/hbmartin/refindery)** — the backend that
+  fetches, extracts, and indexes submitted pages.
+- **[Refindery Chrome extension](https://github.com/hbmartin/refindery-chrome-extension)**
+  — send pages to Refindery directly from Chrome and other Chromium browsers.
+
 ## Features
 
 - **Multi-browser, multi-profile discovery** with the browser's own profile

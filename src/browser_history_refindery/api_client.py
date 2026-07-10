@@ -7,7 +7,7 @@ from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Self
 
-import httpx
+import httpx2
 
 from browser_history_refindery.api_models import (
     BlacklistedResponse,
@@ -93,7 +93,7 @@ class RefinderyClient:
         ready_timeout: float,
     ) -> None:
         self._ready_timeout = ready_timeout
-        self._http = httpx.AsyncClient(
+        self._http = httpx2.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {auth_token}"},
             timeout=request_timeout,
@@ -118,7 +118,7 @@ class RefinderyClient:
                 response = await self._http.get("/readyz")
                 if response.status_code == HTTPStatus.OK:
                     return
-            except httpx.TransportError:
+            except httpx2.TransportError:
                 pass
             if time.monotonic() >= deadline:
                 raise ReadyTimeoutError(self._ready_timeout)
@@ -199,7 +199,7 @@ class RefinderyClient:
         response.raise_for_status()
 
     @staticmethod
-    def _detail(response: httpx.Response) -> str:
+    def _detail(response: httpx2.Response) -> str:
         try:
             detail = response.json().get("detail")
         except ValueError:

@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 
-import httpx
+import httpx2
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -51,7 +51,7 @@ async def _poll_pages(
             for page_id in page_ids:
                 try:
                     status = await client.page_status(page_id)
-                except (httpx.HTTPError, ServerError):
+                except (httpx2.HTTPError, ServerError):
                     continue
                 await state.update_page_status(
                     page_id=page_id,

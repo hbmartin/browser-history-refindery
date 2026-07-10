@@ -70,7 +70,7 @@ def test_safari_reader_title_from_newest_visit(tmp_path):
     assert records[0].last_visit_at == T2
 
 
-def test_safari_reader_uses_older_title_after_watermark(tmp_path):
+def test_safari_reader_uses_older_title_after_watermark(tmp_path) -> None:
     db = tmp_path / "History.db"
     make_safari_db(db, [("https://s.example/", "Older Title", [T0, T2])])
     with closing(sqlite3.connect(db)) as conn:
@@ -79,4 +79,6 @@ def test_safari_reader_uses_older_title_after_watermark(tmp_path):
     records = read_profile(profile_for(db, BrowserFamily.SAFARI), since=T1)
     assert len(records) == 1
     assert records[0].title == "Older Title"
+    assert records[0].visit_count == 1
+    assert records[0].first_visit_at == T2
     assert records[0].last_visit_at == T2

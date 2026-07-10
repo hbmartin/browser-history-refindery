@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-import httpx
+import httpx2
 from rich.console import Console
 from rich.live import Live
 
@@ -273,7 +273,7 @@ class _Runner:
     async def _submit_one(self, item: UrlSubmission) -> None:
         try:
             outcome = await self.client.ingest_url(item.to_request(self.hostname))
-        except (httpx.TransportError, ServerError) as exc:
+        except (httpx2.TransportError, ServerError) as exc:
             self._handle_submit_error(item, exc)
             return
         except ValidationRejectedError as exc:
@@ -373,7 +373,7 @@ class _Runner:
                 return
             try:
                 status = await self.client.page_status(page_id)
-            except (httpx.HTTPError, ServerError):
+            except (httpx2.HTTPError, ServerError):
                 continue
             await self.state.update_page_status(
                 page_id=page_id, status=status.status, last_error=status.last_error
@@ -394,7 +394,7 @@ class _Runner:
         """Feed the server's pending-job depth into the pacer."""
         limit = self.config.pacing.queue_depth_threshold + 1
         while not self.shutdown.is_set() and not self.stats.submitter_finished:
-            with contextlib.suppress(httpx.HTTPError, ServerError):
+            with contextlib.suppress(httpx2.HTTPError, ServerError):
                 depth = await self.client.pending_job_count(limit=limit)
                 self.pacer.on_backlog(depth)
                 self.stats.server_backlog = depth

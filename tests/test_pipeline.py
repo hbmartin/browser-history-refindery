@@ -4,6 +4,7 @@ import io
 import json
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 
 import httpx
 import pytest
@@ -112,6 +113,18 @@ def test_runtime_only_exception_group_unwraps_first_error():
     assert _runtime_error_from_group(grouped) is first
     mixed = ExceptionGroup("mixed", [first, ValueError("invalid response")])
     assert _runtime_error_from_group(mixed) is None
+
+
+def test_watermark_key_normalizes_history_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    absolute_profile = profile_for(
+        tmp_path / "profile" / "History", BrowserFamily.CHROMIUM
+    )
+    monkeypatch.chdir(tmp_path)
+    relative_profile = profile_for(Path("profile/History"), BrowserFamily.CHROMIUM)
+
+    assert relative_profile.watermark_key == absolute_profile.watermark_key
 
 
 def test_merge_uses_older_nonempty_title_as_fallback(tmp_path):
