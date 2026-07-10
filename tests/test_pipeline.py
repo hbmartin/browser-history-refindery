@@ -2,13 +2,14 @@
 
 import io
 import json
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-import httpx
+import httpx2
 import pytest
-import respx
+from pytest_httpx2 import HTTPXMock
 from rich.console import Console
 
 from browser_history_refindery.api_client import AuthError
@@ -33,6 +34,10 @@ from tests.conftest import (
 
 BASE = "http://testserver"
 SHARED_URL = "https://shared.example/article"
+
+
+def endpoint(path: str) -> str:
+    return f"{BASE}{path}"
 
 
 def make_config(tmp_path) -> AppConfig:
@@ -78,30 +83,72 @@ def quiet_console() -> Console:
     return Console(file=io.StringIO(), force_terminal=False, width=100)
 
 
-def _ingest_response(request: httpx.Request) -> httpx.Response:
+def _ingest_response(request: httpx2.Request) -> httpx2.Response:
     body = json.loads(request.content)
     if body["url"] == "https://blocked.example/":
-        return httpx.Response(
+        return httpx2.Response(
             403, json={"error": "blacklisted", "pattern": "blocked.example"}
         )
     page_id = f"pg_{abs(hash(body['url'])) % 10_000}"
-    return httpx.Response(202, json={"page_id": page_id, "status": "queued"})
+    return httpx2.Response(202, json={"page_id": page_id, "status": "queued"})
 
 
-def _status_response(request: httpx.Request, page_id: str) -> httpx.Response:
-    return httpx.Response(
+def _status_response(request: httpx2.Request) -> httpx2.Response:
+    page_id = request.url.path.rsplit("/", maxsplit=2)[-2]
+    return httpx2.Response(
         200, json={"page_id": page_id, "status": "indexed", "last_error": None}
     )
 
 
-def mock_api(router):
-    """Wire all routes; returns the POST /v1/pages route for call inspection."""
-    router.get("/readyz").respond(200, json={"status": "ready"})
-    router.get("/v1/jobs").respond(200, json={"jobs": []})
-    router.get(url__regex=r".*/v1/pages/(?P<page_id>[^/]+)/status").mock(
-        side_effect=_status_response
+def mock_preflight(
+    httpx2_mock: HTTPXMock,
+    *,
+    ready_optional: bool = False,
+    jobs_optional: bool = False,
+) -> None:
+    httpx2_mock.add_response(
+        method="GET",
+        url=endpoint("/readyz"),
+        status_code=200,
+        json={"status": "ready"},
+        is_optional=ready_optional,
+        is_reusable=True,
     )
-    return router.post("/v1/pages").mock(side_effect=_ingest_response)
+    httpx2_mock.add_response(
+        method="GET",
+        url=re.compile(rf"{re.escape(endpoint('/v1/jobs'))}(?:\?.*)?"),
+        status_code=200,
+        json={"jobs": []},
+        is_optional=jobs_optional,
+        is_reusable=True,
+    )
+
+
+def mock_api(httpx2_mock: HTTPXMock, *, is_optional: bool = False) -> None:
+    """Wire all import API routes."""
+    mock_preflight(
+        httpx2_mock,
+        ready_optional=is_optional,
+        jobs_optional=is_optional,
+    )
+    httpx2_mock.add_callback(
+        _status_response,
+        method="GET",
+        url=re.compile(rf"{re.escape(BASE)}/v1/pages/[^/]+/status"),
+        is_optional=is_optional,
+        is_reusable=True,
+    )
+    httpx2_mock.add_callback(
+        _ingest_response,
+        method="POST",
+        url=endpoint("/v1/pages"),
+        is_optional=is_optional,
+        is_reusable=True,
+    )
+
+
+def ingest_requests(httpx2_mock: HTTPXMock) -> list[httpx2.Request]:
+    return httpx2_mock.get_requests(method="POST", url=endpoint("/v1/pages"))
 
 
 def test_runtime_only_exception_group_unwraps_first_error():
@@ -155,9 +202,8 @@ def test_merge_uses_older_nonempty_title_as_fallback(tmp_path):
     assert merged[url].last_visit_at == T2
 
 
-@respx.mock(base_url=BASE)
-async def test_full_import_run(respx_mock, tmp_path):
-    pages_route = mock_api(respx_mock)
+async def test_full_import_run(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
+    mock_api(httpx2_mock)
     config = make_config(tmp_path)
     profiles = make_profiles(tmp_path)
 
@@ -172,7 +218,7 @@ async def test_full_import_run(respx_mock, tmp_path):
     assert stats.indexed == 2
 
     # The shared URL merged across both browsers: newest source is Safari.
-    posts = [json.loads(call.request.content) for call in pages_route.calls]
+    posts = [json.loads(request.content) for request in ingest_requests(httpx2_mock)]
     shared = next(body for body in posts if body["url"] == SHARED_URL)
     assert shared["source"] == "history-import:test-safari"
     assert shared["metadata"]["visit_count"] == 3
@@ -189,9 +235,10 @@ async def test_full_import_run(respx_mock, tmp_path):
     assert watermark == T1  # newest chrome visit
 
 
-@respx.mock(base_url=BASE)
-async def test_second_run_is_incremental(respx_mock, tmp_path):
-    mock_api(respx_mock)
+async def test_second_run_is_incremental(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_api(httpx2_mock)
     config = make_config(tmp_path)
     profiles = make_profiles(tmp_path)
 
@@ -204,9 +251,10 @@ async def test_second_run_is_incremental(respx_mock, tmp_path):
     assert second.submitted == 0
 
 
-@respx.mock(base_url=BASE)
-async def test_limited_run_leaves_watermarks_for_remaining_urls(respx_mock, tmp_path):
-    mock_api(respx_mock)
+async def test_limited_run_leaves_watermarks_for_remaining_urls(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_api(httpx2_mock)
     config = make_config(tmp_path)
     profiles = make_profiles(tmp_path)
 
@@ -224,11 +272,10 @@ async def test_limited_run_leaves_watermarks_for_remaining_urls(respx_mock, tmp_
     assert second.blacklisted == 1
 
 
-@respx.mock(base_url=BASE)
 async def test_limited_run_keeps_watermarks_for_fully_submitted_profiles(
-    respx_mock, tmp_path
-):
-    mock_api(respx_mock)
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_api(httpx2_mock)
     config = make_config(tmp_path)
     old_db = tmp_path / "old-History"
     make_chromium_db(old_db, [("https://old.example/", "Old", [T0], 0)])
@@ -257,9 +304,10 @@ async def test_limited_run_keeps_watermarks_for_fully_submitted_profiles(
         assert await state.get_watermark(new_profile) == T1
 
 
-@respx.mock(base_url=BASE)
-async def test_revisit_uses_last_observed_visit_time(respx_mock, tmp_path):
-    pages_route = mock_api(respx_mock)
+async def test_revisit_uses_last_observed_visit_time(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_api(httpx2_mock)
     config = make_config(tmp_path)
     config.import_.resubmit_revisits = True
     db = tmp_path / "History"
@@ -281,18 +329,21 @@ async def test_revisit_uses_last_observed_visit_time(respx_mock, tmp_path):
     )
     assert second.total_to_submit == 1
     assert second.accepted == 1
-    assert len(pages_route.calls) == 2
+    assert len(ingest_requests(httpx2_mock)) == 2
     async with StateStore(config.state.db_path) as state:
         observed = await state.load_submission_visit_times()
     assert observed[url] == T1
 
 
-@respx.mock(base_url=BASE, assert_all_called=False)
-async def test_task_group_unwraps_auth_error(respx_mock, tmp_path):
-    respx_mock.get("/readyz").respond(200, json={"status": "ready"})
-    respx_mock.get("/v1/jobs").respond(200, json={"jobs": []})
-    respx_mock.post("/v1/pages").respond(
-        401, json={"detail": "missing or invalid bearer token"}
+async def test_task_group_unwraps_auth_error(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_preflight(httpx2_mock, jobs_optional=True)
+    httpx2_mock.add_response(
+        method="POST",
+        url=endpoint("/v1/pages"),
+        status_code=401,
+        json={"detail": "missing or invalid bearer token"},
     )
     config = make_config(tmp_path)
     config.import_.resubmit_revisits = True
@@ -307,12 +358,15 @@ async def test_task_group_unwraps_auth_error(respx_mock, tmp_path):
         )
 
 
-@respx.mock(base_url=BASE, assert_all_called=False)
-async def test_validation_rejection_is_terminal_and_not_retried(respx_mock, tmp_path):
-    respx_mock.get("/readyz").respond(200, json={"status": "ready"})
-    respx_mock.get("/v1/jobs").respond(200, json={"jobs": []})
-    pages_route = respx_mock.post("/v1/pages").respond(
-        422, json={"detail": "URL is not ingestible"}
+async def test_validation_rejection_is_terminal_and_not_retried(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_preflight(httpx2_mock, jobs_optional=True)
+    httpx2_mock.add_response(
+        method="POST",
+        url=endpoint("/v1/pages"),
+        status_code=422,
+        json={"detail": "URL is not ingestible"},
     )
     config = make_config(tmp_path)
     db = tmp_path / "History"
@@ -361,12 +415,11 @@ async def test_validation_rejection_is_terminal_and_not_retried(respx_mock, tmp_
     assert second.total_to_submit == 0
     assert second.previously_rejected == 1
     assert second.already_submitted == 0
-    assert len(pages_route.calls) == 1
+    assert len(ingest_requests(httpx2_mock)) == 1
 
 
-@respx.mock(base_url=BASE, assert_all_called=False)
-async def test_dry_run_submits_nothing(respx_mock, tmp_path):
-    pages_route = mock_api(respx_mock)
+async def test_dry_run_submits_nothing(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
+    mock_api(httpx2_mock, is_optional=True)
     config = make_config(tmp_path)
     profiles = make_profiles(tmp_path)
 
@@ -374,4 +427,4 @@ async def test_dry_run_submits_nothing(respx_mock, tmp_path):
         config=config, profiles=profiles, console=quiet_console(), dry_run=True
     )
     assert stats.total_to_submit == 3
-    assert not pages_route.calls
+    assert not ingest_requests(httpx2_mock)
