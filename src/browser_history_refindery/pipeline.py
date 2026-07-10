@@ -43,6 +43,7 @@ class SourceInfo:
     browser: str
     profile: str
     profile_key: str
+    watermark_key: tuple[str, str]
     visit_count: int
     first_visit_at: datetime
     last_visit_at: datetime
@@ -122,6 +123,7 @@ def _merge_record(merged: dict[str, UrlSubmission], record: VisitRecord) -> None
         browser=record.profile.browser_id,
         profile=record.profile.profile_name,
         profile_key=record.profile.key,
+        watermark_key=record.profile.watermark_key,
         visit_count=record.visit_count,
         first_visit_at=record.first_visit_at,
         last_visit_at=record.last_visit_at,
@@ -179,8 +181,8 @@ async def _build_plan(
     if limit is not None and len(keep) > limit:
         # Profiles whose URLs were cut must be re-read next run, so their
         # watermarks must not advance; the submissions table dedups the rest.
-        dropped_keys = {
-            source.profile_key
+        dropped_watermark_keys = {
+            source.watermark_key
             for submission in keep[limit:]
             for source in submission.sources
         }
@@ -188,7 +190,7 @@ async def _build_plan(
         watermarks = {
             profile: watermark
             for profile, watermark in watermarks.items()
-            if profile.key not in dropped_keys
+            if profile.watermark_key not in dropped_watermark_keys
         }
     stats.total_to_submit = len(keep)
     for submission in keep:

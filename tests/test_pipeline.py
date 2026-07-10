@@ -26,7 +26,6 @@ from tests.conftest import (
     T1,
     T2,
     make_chromium_db,
-    make_firefox_db,
     make_safari_db,
     profile_for,
 )
@@ -220,10 +219,13 @@ async def test_limited_run_keeps_watermarks_for_fully_submitted_profiles(
     config = make_config(tmp_path)
     old_db = tmp_path / "old-History"
     make_chromium_db(old_db, [("https://old.example/", "Old", [T0], 0)])
-    new_db = tmp_path / "new-places.sqlite"
-    make_firefox_db(new_db, [("https://new.example/", "New", [T1], 0)])
+    new_db = tmp_path / "new-History"
+    make_chromium_db(new_db, [("https://new.example/", "New", [T1], 0)])
     old_profile = profile_for(old_db, BrowserFamily.CHROMIUM)
-    new_profile = profile_for(new_db, BrowserFamily.FIREFOX)
+    new_profile = profile_for(new_db, BrowserFamily.CHROMIUM)
+
+    assert old_profile.key == new_profile.key
+    assert old_profile.watermark_key != new_profile.watermark_key
 
     stats = await run_import(
         config=config,
@@ -232,8 +234,9 @@ async def test_limited_run_keeps_watermarks_for_fully_submitted_profiles(
         limit=1,
     )
 
-    # The newest URL (firefox) made the cut, so only the chromium profile —
-    # whose URL was dropped — must be re-read on the next run.
+    # The newest URL made the cut, so only the profile whose URL was dropped
+    # must be re-read on the next run, even though both use the same family and
+    # profile directory name.
     assert stats.total_to_submit == 1
     assert stats.accepted == 1
     async with StateStore(config.state.db_path) as state:

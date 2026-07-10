@@ -49,3 +49,5 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 - Typer commands use keyword-only params (`*,`) so ruff FBT rules stay happy; `import` is a keyword so the command function is `import_` registered with `name="import"`.
 - `config.toml` and `refindery_state.sqlite3*` are gitignored (the config holds the bearer token).
 - The default-config template is a hand-commented string constant (`DEFAULT_CONFIG_TOML`) kept in sync with the pydantic defaults — `test_first_run_writes_template` verifies it parses back to `AppConfig()`.
+- `BrowserProfile.key` is the readable `browser_id:profile_dir` stats key and can collide across distinct history paths; use the path-aware `BrowserProfile.watermark_key` for persisted watermark lookups and `--limit` pruning. Watermark tests should use same-family profiles with the same profile directory name to cover collisions explicitly.
+- Safari incremental reads limit visit aggregates to the post-watermark window, but title fallback must search the URL's full visit history so an untitled revisit can reuse an older title.
