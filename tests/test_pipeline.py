@@ -1,5 +1,6 @@
 """End-to-end pipeline tests: fixture DBs -> mocked API -> state DB."""
 
+import asyncio
 import io
 import json
 import re
@@ -16,13 +17,16 @@ from browser_history_refindery.api_client import AuthError
 from browser_history_refindery.browsers import BrowserFamily
 from browser_history_refindery.browsers.base import VisitRecord, to_chromium_us
 from browser_history_refindery.config import AppConfig
+from browser_history_refindery.filters import ExclusionEngine
 from browser_history_refindery.pipeline import (
     UrlSubmission,
     _merge_record,
     _runtime_error_from_group,
+    _stream_profiles,
     run_import,
 )
 from browser_history_refindery.state import StateStore
+from browser_history_refindery.stats import RunStats
 from tests.conftest import (
     T0,
     T1,
@@ -217,13 +221,11 @@ async def test_full_import_run(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
     assert stats.errors == 0
     assert stats.indexed == 2
 
-    # The shared URL merged across both browsers: newest source is Safari.
+    # The shared URL is submitted exactly once. Under streaming the fully-merged
+    # cross-profile shape is timing-dependent (see the dedicated merge test that
+    # exercises _stream_profiles directly), so we only assert it was sent once.
     posts = [json.loads(request.content) for request in ingest_requests(httpx2_mock)]
-    shared = next(body for body in posts if body["url"] == SHARED_URL)
-    assert shared["source"] == "history-import:test-safari"
-    assert shared["metadata"]["visit_count"] == 3
-    assert len(shared["metadata"]["sources"]) == 2
-    assert shared["title"] == "Shared (safari)"
+    assert sum(body["url"] == SHARED_URL for body in posts) == 1
 
     async with StateStore(config.state.db_path) as state:
         counts = await state.status_counts()
@@ -418,6 +420,70 @@ async def test_validation_rejection_is_terminal_and_not_retried(
     assert len(ingest_requests(httpx2_mock)) == 1
 
 
+async def test_transient_server_error_is_retried_then_succeeds(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_preflight(httpx2_mock, jobs_optional=True)
+    httpx2_mock.add_response(
+        method="POST", url=endpoint("/v1/pages"), status_code=503, json={}
+    )  # single-use: the first attempt fails
+    httpx2_mock.add_callback(
+        _ingest_response,
+        method="POST",
+        url=endpoint("/v1/pages"),
+        is_reusable=True,
+    )
+    httpx2_mock.add_callback(
+        _status_response,
+        method="GET",
+        url=re.compile(rf"{re.escape(BASE)}/v1/pages/[^/]+/status"),
+        is_optional=True,
+        is_reusable=True,
+    )
+    config = make_config(tmp_path)
+    db = tmp_path / "History"
+    make_chromium_db(db, [("https://flaky.example/", "Flaky", [T0], 0)])
+
+    stats = await run_import(
+        config=config,
+        profiles=[profile_for(db, BrowserFamily.CHROMIUM)],
+        console=quiet_console(),
+    )
+
+    assert stats.retries == 1
+    assert stats.accepted == 1
+    assert stats.errors == 0
+    assert len(ingest_requests(httpx2_mock)) == 2
+
+
+async def test_repeated_errors_give_up_and_hold_watermark(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_preflight(httpx2_mock, jobs_optional=True)
+    httpx2_mock.add_response(
+        method="POST",
+        url=endpoint("/v1/pages"),
+        status_code=503,
+        json={},
+        is_reusable=True,  # every attempt fails
+    )
+    config = make_config(tmp_path)
+    config.pacing.max_attempts = 2
+    db = tmp_path / "History"
+    profile = profile_for(db, BrowserFamily.CHROMIUM)
+    make_chromium_db(db, [("https://down.example/", "Down", [T0], 0)])
+
+    stats = await run_import(config=config, profiles=[profile], console=quiet_console())
+
+    assert stats.retries == 1  # one retry, then the second attempt gives up
+    assert stats.errors == 1
+    assert stats.accepted == 0
+    assert len(ingest_requests(httpx2_mock)) == 2
+    async with StateStore(config.state.db_path) as state:
+        # An errored run must not advance the watermark.
+        assert await state.get_watermark(profile) is None
+
+
 async def test_dry_run_submits_nothing(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
     mock_api(httpx2_mock, is_optional=True)
     config = make_config(tmp_path)
@@ -427,4 +493,152 @@ async def test_dry_run_submits_nothing(httpx2_mock: HTTPXMock, tmp_path: Path) -
         config=config, profiles=profiles, console=quiet_console(), dry_run=True
     )
     assert stats.total_to_submit == 3
+    assert stats.urls_read_total == 5  # 3 chrome rows + 2 safari rows
+    assert stats.unique_urls == 4  # SHARED_URL merges across the two browsers
     assert not ingest_requests(httpx2_mock)
+
+
+async def test_stream_profiles_merges_across_profiles(tmp_path: Path) -> None:
+    """_stream_profiles fully merges a shared URL once every profile is read."""
+    config = make_config(tmp_path)
+    profiles = make_profiles(tmp_path)
+    stats = RunStats()
+    collected: list[UrlSubmission] = []
+
+    async def collect(submission: UrlSubmission) -> None:
+        collected.append(submission)
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        watermarks = await _stream_profiles(
+            profiles,
+            engine=ExclusionEngine(config.exclusions),
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=False,
+            limit=None,
+            shutdown=asyncio.Event(),
+            emit=collect,
+        )
+
+    assert stats.reading_finished
+    shared = next(
+        submission for submission in collected if submission.url == SHARED_URL
+    )
+    assert shared.primary.browser == "test-safari"
+    assert shared.total_visits == 3
+    assert len(shared.sources) == 2
+    assert shared.title == "Shared (safari)"
+    # Both profiles were fully read, so both offer a watermark.
+    assert set(watermarks.values()) == {T1, T2}
+
+
+async def test_streaming_emits_first_profile_before_reading_second(
+    tmp_path: Path,
+) -> None:
+    """A profile's URLs are emitted before the next profile is read."""
+    config = make_config(tmp_path)
+    first_db = tmp_path / "first-History"
+    make_chromium_db(first_db, [("https://first.example/", "First", [T0], 0)])
+    second_db = tmp_path / "second-History"
+    make_chromium_db(second_db, [("https://second.example/", "Second", [T1], 0)])
+    profiles = [
+        profile_for(first_db, BrowserFamily.CHROMIUM),
+        profile_for(second_db, BrowserFamily.CHROMIUM),
+    ]
+    # Same family + profile dir name means distinct history paths but one stats key.
+    order: list[str] = []
+    stats = RunStats()
+
+    async def record(submission: UrlSubmission) -> None:
+        order.append(submission.url)
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        await _stream_profiles(
+            profiles,
+            engine=ExclusionEngine(config.exclusions),
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=False,
+            limit=None,
+            shutdown=asyncio.Event(),
+            emit=record,
+        )
+
+    # Unbounded streaming preserves profile order (not a global newest-first sort).
+    assert order == ["https://first.example/", "https://second.example/"]
+
+
+async def test_stream_profiles_stops_on_shutdown(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    profiles = make_profiles(tmp_path)
+    stats = RunStats()
+    shutdown = asyncio.Event()
+    shutdown.set()  # already requested before any profile is read
+
+    async def collect(_submission: UrlSubmission) -> None:
+        pytest.fail("nothing should be emitted after shutdown")
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        watermarks = await _stream_profiles(
+            profiles,
+            engine=ExclusionEngine(config.exclusions),
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=False,
+            limit=None,
+            shutdown=shutdown,
+            emit=collect,
+        )
+
+    assert stats.profiles_read == 0
+    assert stats.total_to_submit == 0
+    assert watermarks == {}
+    assert stats.reading_finished  # the phase still completes (with no work)
+
+
+async def test_limited_direct_keeps_global_newest(tmp_path: Path) -> None:
+    """The bounded path emits the newest URLs across all profiles, in order."""
+    config = make_config(tmp_path)
+    older = tmp_path / "older-History"
+    make_chromium_db(older, [("https://older.example/", "Older", [T0], 0)])
+    newer = tmp_path / "newer-History"
+    make_chromium_db(newer, [("https://newer.example/", "Newer", [T2], 0)])
+    profiles = [
+        profile_for(older, BrowserFamily.CHROMIUM),
+        profile_for(newer, BrowserFamily.CHROMIUM),
+    ]
+    stats = RunStats()
+    order: list[str] = []
+
+    async def record(submission: UrlSubmission) -> None:
+        order.append(submission.url)
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        watermarks = await _stream_profiles(
+            profiles,
+            engine=ExclusionEngine(config.exclusions),
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=False,
+            limit=1,
+            shutdown=asyncio.Event(),
+            emit=record,
+        )
+
+    # Even though the older profile is read first, only the globally-newest URL
+    # is emitted, and the dropped profile keeps no watermark.
+    assert order == ["https://newer.example/"]
+    assert set(watermarks.values()) == {T2}
+    assert profiles[0] not in watermarks

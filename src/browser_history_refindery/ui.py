@@ -39,17 +39,50 @@ def select_profiles(profiles: list[BrowserProfile]) -> list[BrowserProfile]:
     return selected if selected is not None else []
 
 
-def build_progress(*, total: int) -> tuple[Progress, TaskID]:
-    """Create the overall progress bar for the dashboard."""
+def build_progress() -> tuple[Progress, TaskID, TaskID]:
+    """Create the reading and submitting progress bars for the dashboard."""
     progress = Progress(
-        TextColumn("[bold blue]submitting"),
+        TextColumn("[bold blue]{task.description}"),
         BarColumn(bar_width=None),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     )
-    task_id = progress.add_task("submit", total=total)
-    return progress, task_id
+    reading_id = progress.add_task("reading   ", total=1)
+    submit_id = progress.add_task("submitting", total=0)
+    return progress, reading_id, submit_id
+
+
+def _phase(stats: RunStats) -> str:
+    if not stats.reading_finished:
+        return "[cyan]reading history[/]"
+    if not stats.submitter_finished:
+        return "[cyan]submitting[/]"
+    return "[cyan]draining (indexing)[/]"
+
+
+def _header(stats: RunStats) -> Table:
+    table = Table.grid(padding=(0, 2))
+    for _ in range(6):
+        table.add_column()
+    table.add_row(
+        "phase",
+        _phase(stats),
+        "elapsed",
+        f"{stats.elapsed_seconds:.0f}s",
+        "rate",
+        f"{stats.throughput:.1f}/s",
+    )
+    profiles = f"{stats.profiles_read}/{stats.profiles_total}"
+    table.add_row(
+        "profiles",
+        profiles,
+        "read",
+        str(stats.urls_read_total),
+        "unique",
+        str(stats.unique_urls),
+    )
+    return table
 
 
 def _counters_table(stats: RunStats) -> Table:
@@ -59,6 +92,9 @@ def _counters_table(stats: RunStats) -> Table:
     table.add_column(style="bold")
     table.add_column(justify="right")
     backlog = "?" if stats.server_backlog is None else str(stats.server_backlog)
+    table.add_row(
+        "queued", str(stats.total_to_submit), "in queue", str(stats.queue_depth)
+    )
     table.add_row(
         "new (202)",
         f"[green]{stats.accepted}[/]",
@@ -71,46 +107,67 @@ def _counters_table(stats: RunStats) -> Table:
     table.add_row(
         "blacklisted (403)",
         f"[yellow]{stats.blacklisted}[/]",
-        "errors",
-        f"[red]{stats.errors}[/]",
+        "retries",
+        f"[yellow]{stats.retries}[/]",
     )
     table.add_row(
         "rejected (422)",
         f"[yellow]{stats.rejected}[/]",
+        "errors",
+        f"[red]{stats.errors}[/]",
+    )
+    table.add_row(
+        "skipped locally",
+        f"[dim]{stats.skipped_locally}[/]",
         "server backlog",
         backlog,
     )
-    skipped_locally = (
-        stats.skipped + stats.already_submitted + stats.previously_rejected
-    )
-    table.add_row("skipped locally", f"[dim]{skipped_locally}[/]", "", "")
     table.add_row("interval", f"{stats.current_interval:.2f}s", "", "")
     return table
 
 
-def _profiles_table(stats: RunStats) -> Table:
+def _profiles_table(stats: RunStats, *, with_status: bool = False) -> Table:
     table = Table(box=None, pad_edge=False)
     table.add_column("profile", style="cyan", no_wrap=True)
+    if with_status:
+        table.add_column("status")
     table.add_column("read", justify="right")
     table.add_column("queued", justify="right")
     table.add_column("sent", justify="right")
     for profile_stats in stats.per_profile.values():
-        table.add_row(
-            profile_stats.label,
+        row = [profile_stats.label]
+        if with_status:
+            row.append("[green]done[/]" if profile_stats.done else "[dim]reading…[/]")
+        row += [
             str(profile_stats.urls_read),
             str(profile_stats.queued_for_submit),
             str(profile_stats.submitted),
-        )
+        ]
+        table.add_row(*row)
     return table
+
+
+def _skip_reasons_line(stats: RunStats) -> str:
+    if not stats.skip_reasons:
+        return "[dim]no local skips[/]"
+    return "  ".join(
+        f"{kind}: {count}" for kind, count in stats.skip_reasons.most_common()
+    )
 
 
 def render_dashboard(stats: RunStats, progress: Progress) -> RenderableType:
     """Compose the live monitoring view."""
     events = "\n".join(stats.events) or "[dim]no events yet[/]"
     return Group(
+        _header(stats),
         progress,
         Panel(_counters_table(stats), title="status", title_align="left"),
-        Panel(_profiles_table(stats), title="profiles", title_align="left"),
+        Panel(
+            _profiles_table(stats, with_status=True),
+            title="profiles",
+            title_align="left",
+        ),
+        Panel(_skip_reasons_line(stats), title="local skips", title_align="left"),
         Panel(events, title="recent events", title_align="left"),
     )
 
@@ -127,6 +184,8 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
     table = Table(box=None, pad_edge=False)
     table.add_column(style="bold")
     table.add_column(justify="right")
+    table.add_row("history URLs read", str(stats.urls_read_total))
+    table.add_row("unique URLs", str(stats.unique_urls))
     table.add_row("URLs submitted", str(stats.submitted))
     table.add_row("new pages queued", str(stats.accepted))
     table.add_row("revisits", str(stats.revisits))
@@ -135,9 +194,12 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
     table.add_row("skipped (rules)", str(stats.skipped))
     table.add_row("already submitted", str(stats.already_submitted))
     table.add_row("previously rejected", str(stats.previously_rejected))
+    table.add_row("retries", str(stats.retries))
     table.add_row("errors", str(stats.errors))
     table.add_row("indexed so far", str(stats.indexed))
     table.add_row("dead", str(stats.dead))
+    table.add_row("elapsed", f"{stats.elapsed_seconds:.0f}s")
+    table.add_row("throughput", f"{stats.throughput:.1f}/s")
     console.print(table)
     for kind, count in stats.skip_reasons.most_common():
         console.print(f"  [dim]skipped by {kind}: {count}[/]")
@@ -159,6 +221,8 @@ def print_dry_run_report(
     table = Table(box=None, pad_edge=False)
     table.add_column(style="bold")
     table.add_column(justify="right")
+    table.add_row("history URLs read", str(stats.urls_read_total))
+    table.add_row("unique URLs", str(stats.unique_urls))
     table.add_row("would submit", str(stats.total_to_submit))
     table.add_row("already submitted", str(stats.already_submitted))
     table.add_row("previously rejected", str(stats.previously_rejected))

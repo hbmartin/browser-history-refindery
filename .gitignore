@@ -7,11 +7,17 @@ site/
 wheels/
 *.egg-info
 
+# Tooling caches (Ruff, pytest, and the Zensical docs build cache)
+.cache/
+.ruff_cache/
+.pytest_cache/
+
 # Virtual environments
 .venv
 
 # refindery-import local files (config holds the auth token)
 config.toml
 refindery_state.sqlite3*
+refindery-import.log*
 reviews_triage/
 triage_decisions.db

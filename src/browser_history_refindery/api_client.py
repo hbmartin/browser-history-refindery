@@ -115,9 +115,8 @@ class RefinderyClient:
         deadline = time.monotonic() + self._ready_timeout
         while True:
             try:
-                is_ready = (
-                    await self._http.get("/readyz")
-                ).status_code == HTTPStatus.OK
+                response = await self._http.get("/readyz")
+                is_ready = response.status_code == HTTPStatus.OK
             except httpx2.TransportError:
                 # A backend that has not bound its socket is not ready yet.
                 is_ready = False

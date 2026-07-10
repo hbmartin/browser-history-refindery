@@ -11,7 +11,8 @@ from browser_history_refindery.browsers import (
     BrowserProfile,
     discover_all,
 )
-from browser_history_refindery.config import load_or_create
+from browser_history_refindery.config import ConfigError, load_or_create
+from browser_history_refindery.logsetup import configure_logging, logger
 from browser_history_refindery.pipeline import run_import
 from browser_history_refindery.ui import select_profiles
 
@@ -67,7 +68,12 @@ def run(
 ) -> None:
     """Entry point for ``refindery-import [import]``."""
     console = Console()
-    config, created = load_or_create(config_path)
+    try:
+        config, created = load_or_create(config_path)
+    except ConfigError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    configure_logging(config.logging)
     if created:
         console.print(
             f"[yellow]Created {config_path} with defaults — review it (especially "
@@ -76,6 +82,7 @@ def run(
     profiles = _resolve_profiles(
         console, db_path=db_path, family=family, select_all=select_all
     )
+    logger.info("import command: {} profile(s) selected", len(profiles))
     try:
         asyncio.run(
             run_import(
