@@ -2,8 +2,25 @@
 name = "browser-history-refindery"
 version = "0.1.0"
 description = "Import macOS browser history into a Refindery backend"
+authors = [
+    { name = "Harold Martin", email = "harold.martin@gmail.com" },
+]
 readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+keywords = ["browser-history", "chrome", "firefox", "refindery", "safari"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Utilities",
+]
 dependencies = [
     "aiosqlite>=0.22.1",
     "httpx2>=2.2.0",
@@ -21,6 +38,7 @@ Homepage = "https://github.com/hbmartin/browser-history-refindery"
 Documentation = "https://hbmartin.github.io/browser-history-refindery/"
 Repository = "https://github.com/hbmartin/browser-history-refindery"
 Changelog = "https://github.com/hbmartin/browser-history-refindery/releases"
+Issues = "https://github.com/hbmartin/browser-history-refindery/issues"
 
 [dependency-groups]
 dev = [
@@ -38,6 +56,9 @@ dev = [
 docs = [
     "zensical>=0.0.47,<0.1",
 ]
+
+[tool.deptry]
+known_first_party = ["browser_history_refindery"]
 
 [tool.pyrefly]
 search-path = ["src", "."]
