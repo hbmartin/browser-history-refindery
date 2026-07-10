@@ -2,6 +2,7 @@
 
 import shutil
 import sqlite3
+import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -9,16 +10,22 @@ from pathlib import Path
 
 _SIDECAR_SUFFIXES = ("-wal", "-shm")
 
+_MACOS_HINT = (
+    "grant Full Disk Access to your terminal app in System Settings > "
+    "Privacy & Security > Full Disk Access, then restart the terminal"
+)
+_OTHER_HINT = (
+    "check that your user can read the file (close the browser if it holds a "
+    "lock, or the file may be owned by another user)"
+)
+
 
 class FullDiskAccessError(RuntimeError):
-    """Raised when macOS privacy protections block reading a history database."""
+    """Raised when the OS blocks reading a history database (permissions)."""
 
     def __init__(self, db_path: Path) -> None:
-        super().__init__(
-            f"cannot read {db_path}: grant Full Disk Access to your terminal app in "
-            "System Settings > Privacy & Security > Full Disk Access, then restart "
-            "the terminal"
-        )
+        hint = _MACOS_HINT if sys.platform == "darwin" else _OTHER_HINT
+        super().__init__(f"cannot read {db_path}: {hint}")
         self.db_path = db_path
 
 

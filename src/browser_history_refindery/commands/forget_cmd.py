@@ -10,6 +10,7 @@ from rich.table import Table
 
 from browser_history_refindery.api_client import RefinderyClient
 from browser_history_refindery.config import AppConfig, load_or_create
+from browser_history_refindery.logsetup import configure_logging
 
 
 def _client(config: AppConfig) -> RefinderyClient:
@@ -27,6 +28,7 @@ def _run_with_client[T](
     action: Callable[[RefinderyClient], Awaitable[T]],
 ) -> T:
     config, _ = load_or_create(config_path)
+    configure_logging(config.logging)
 
     async def runner() -> T:
         async with _client(config) as client:

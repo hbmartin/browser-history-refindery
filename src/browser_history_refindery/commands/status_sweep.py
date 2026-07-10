@@ -10,6 +10,7 @@ from rich.table import Table
 
 from browser_history_refindery.api_client import RefinderyClient, ServerError
 from browser_history_refindery.config import AppConfig, load_or_create
+from browser_history_refindery.logsetup import configure_logging
 from browser_history_refindery.state import StateStore
 
 _SWEEP_BATCH = 500
@@ -18,6 +19,7 @@ _INTER_REQUEST_SLEEP = 0.1
 
 async def _sweep(config_path: Path, console: Console) -> None:
     config, _ = load_or_create(config_path)
+    configure_logging(config.logging)
     async with StateStore(config.state.db_path) as state:
         page_ids = await state.nonterminal_pages(limit=_SWEEP_BATCH)
         if not page_ids:

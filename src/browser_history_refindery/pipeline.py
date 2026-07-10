@@ -1,12 +1,26 @@
-"""The import pipeline: read, merge, filter, submit, and track pages."""
+"""The import pipeline: read, merge, filter, submit, and track pages.
+
+Reading and submitting overlap: a *producer* streams profiles one at a time
+(read → merge → filter → enqueue) while the *submitter* drains the queue, so
+submission of the first profile's URLs begins while later profiles are still
+being read. Every enqueued ``UrlSubmission`` is the same object held in the
+merge map, so a later profile's sighting mutates it in place *until it is sent*;
+cross-profile merge is therefore best-effort in streaming mode (a URL already
+submitted keeps the metadata it had at send time — the submissions table dedups
+it, so the later sighting is not re-sent). A ``--limit`` run instead reads and
+merges every profile before emitting, because the newest URLs across all
+profiles must win the capped slots — there the merge is always complete.
+"""
 
 import asyncio
 import contextlib
 import signal
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 import httpx2
@@ -25,6 +39,7 @@ from browser_history_refindery.api_models import IngestPageRequest
 from browser_history_refindery.browsers import BrowserProfile, VisitRecord, read_profile
 from browser_history_refindery.config import AppConfig
 from browser_history_refindery.filters import ExclusionEngine, SkipReason
+from browser_history_refindery.logsetup import logger
 from browser_history_refindery.pacer import AdaptivePacer
 from browser_history_refindery.state import StateStore
 from browser_history_refindery.stats import ProfileStats, RunStats
@@ -34,6 +49,8 @@ from browser_history_refindery.ui import (
     print_summary,
     render_dashboard,
 )
+
+Emit = Callable[["UrlSubmission"], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,13 +126,12 @@ class UrlSubmission:
         )
 
 
-@dataclass(slots=True)
-class ImportPlan:
-    """Everything the submitter needs, computed up front."""
+class Disposition(StrEnum):
+    """The non-skip outcome of classifying a merged URL before submission."""
 
-    submissions: list[UrlSubmission]
-    watermarks: dict[BrowserProfile, datetime]
-    urls_seen: int
+    ENQUEUE = "enqueue"
+    ALREADY = "already"
+    REJECTED = "rejected"
 
 
 def _merge_record(merged: dict[str, UrlSubmission], record: VisitRecord) -> None:
@@ -143,7 +159,115 @@ def _short(url: str, limit: int = 60) -> str:
     return url if len(url) <= limit else f"{url[: limit - 1]}…"
 
 
-async def _build_plan(
+def _classify(
+    url: str,
+    submission: UrlSubmission,
+    *,
+    submitted: dict[str, datetime],
+    permanently_rejected: set[str],
+    engine: ExclusionEngine,
+    resubmit_revisits: bool,
+) -> Disposition | SkipReason:
+    """Decide what to do with one merged URL (enqueue, skip, or drop)."""
+    if url in permanently_rejected:
+        return Disposition.REJECTED
+    if (prior := submitted.get(url)) is not None and (
+        not resubmit_revisits or submission.last_visit_at <= prior
+    ):
+        return Disposition.ALREADY
+    if reason := engine.check(url):
+        return reason
+    return Disposition.ENQUEUE
+
+
+@dataclass(slots=True)
+class _Planner:
+    """Running merge/classify state shared across streamed profiles."""
+
+    engine: ExclusionEngine
+    stats: RunStats
+    submitted: dict[str, datetime]
+    permanently_rejected: set[str]
+    resubmit_revisits: bool
+    merged: dict[str, UrlSubmission] = field(default_factory=dict)
+    classified: set[str] = field(default_factory=set)
+
+    def classify_profile(
+        self, touched: list[str]
+    ) -> tuple[list[tuple[str, SkipReason]], list[str]]:
+        """Classify a profile's newly-seen URLs.
+
+        Counts skip/already/rejected outcomes and returns the skips to persist
+        plus the URLs eligible for submission (newest-first). Emission is left to
+        the caller so bounded (``--limit``) and unbounded runs can differ.
+        """
+        skips: list[tuple[str, SkipReason]] = []
+        enqueue: list[str] = []
+        ordered = sorted(
+            touched, key=lambda u: self.merged[u].last_visit_at, reverse=True
+        )
+        for url in ordered:
+            self.classified.add(url)
+            result = _classify(
+                url,
+                self.merged[url],
+                submitted=self.submitted,
+                permanently_rejected=self.permanently_rejected,
+                engine=self.engine,
+                resubmit_revisits=self.resubmit_revisits,
+            )
+            if isinstance(result, SkipReason):
+                skips.append((url, result))
+                self.stats.skipped += 1
+                self.stats.skip_reasons[str(result.kind)] += 1
+            elif result is Disposition.ALREADY:
+                self.stats.already_submitted += 1
+            elif result is Disposition.REJECTED:
+                self.stats.previously_rejected += 1
+            else:
+                enqueue.append(url)
+        return skips, enqueue
+
+    async def emit_one(self, url: str, emit: Emit) -> None:
+        """Emit one submission and update the queued counters."""
+        submission = self.merged[url]
+        await emit(submission)
+        self.stats.total_to_submit += 1
+        if pstats := self.stats.per_profile.get(submission.primary.profile_key):
+            pstats.queued_for_submit += 1
+
+
+async def _read_profile_into(
+    planner: _Planner,
+    profile: BrowserProfile,
+    *,
+    state: StateStore,
+    stats: RunStats,
+    run_id: int,
+    ignore_watermarks: bool,
+) -> tuple[datetime | None, list[str]]:
+    """Read one profile, merge it, and record its skips. Returns (max, enqueue)."""
+    since = None if ignore_watermarks else await state.get_watermark(profile)
+    pstats = stats.per_profile.setdefault(
+        profile.key, ProfileStats(label=profile.display)
+    )
+    records = await asyncio.to_thread(read_profile, profile, since=since)
+    pstats.urls_read += len(records)
+    stats.urls_read_total += len(records)
+    logger.debug("read {} urls from {}", len(records), profile.display)
+    profile_max, touched = _merge_profile(
+        planner.merged, records, classified=planner.classified
+    )
+    stats.unique_urls = len(planner.merged)
+    skips, enqueue = planner.classify_profile(touched)
+    if skips:
+        await state.record_skips(skips, run_id)
+    pstats.done = True
+    stats.profiles_read += 1
+    return profile_max, enqueue
+
+
+async def _stream_profiles(
     profiles: list[BrowserProfile],
     *,
     engine: ExclusionEngine,
@@ -153,83 +277,148 @@ async def _build_plan(
     run_id: int,
     ignore_watermarks: bool,
     limit: int | None,
-) -> ImportPlan:
-    merged: dict[str, UrlSubmission] = {}
-    watermarks: dict[BrowserProfile, datetime] = {}
-    for profile in profiles:
-        since = None if ignore_watermarks else await state.get_watermark(profile)
-        records = await asyncio.to_thread(read_profile, profile, since=since)
-        stats.per_profile[profile.key] = ProfileStats(
-            label=profile.display, urls_read=len(records)
-        )
-        for record in records:
-            _merge_record(merged, record)
-        if records:
-            watermarks[profile] = max(record.last_visit_at for record in records)
-    submitted = await state.load_submission_visit_times()
-    permanently_rejected = await state.load_rejected_urls()
-    keep, skips = _filter_merged(
-        merged,
-        submitted=submitted,
-        permanently_rejected=permanently_rejected,
+    shutdown: asyncio.Event,
+    emit: Emit,
+) -> dict[BrowserProfile, datetime]:
+    """Read, merge, filter, and emit history for submission.
+
+    With no ``--limit`` this truly streams: each profile's eligible URLs are
+    emitted as soon as it is read, so submission overlaps reading the rest.
+    Cross-profile merge is best-effort in that mode — a URL already sent before a
+    later profile is read keeps the metadata it had at send time. With a
+    ``--limit`` the newest-across-all-profiles URLs must win the capped slots, so
+    all profiles are read and merged first, then the top URLs are emitted;
+    profiles whose URLs are dropped keep their watermark unset for the next run.
+    """
+    planner = _Planner(
         engine=engine,
         stats=stats,
+        submitted=await state.load_submission_visit_times(),
+        permanently_rejected=await state.load_rejected_urls(),
         resubmit_revisits=config.import_.resubmit_revisits,
     )
-    await state.record_skips(skips, run_id)
-    keep.sort(key=lambda submission: submission.last_visit_at, reverse=True)
-    if limit is not None and len(keep) > limit:
-        # Profiles whose URLs were cut must be re-read next run, so their
-        # watermarks must not advance; the submissions table dedups the rest.
-        dropped_watermark_keys = {
-            source.watermark_key
-            for submission in keep[limit:]
-            for source in submission.sources
-        }
-        keep = keep[:limit]
-        watermarks = {
-            profile: watermark
-            for profile, watermark in watermarks.items()
-            if profile.watermark_key not in dropped_watermark_keys
-        }
-    stats.total_to_submit = len(keep)
-    for submission in keep:
-        if profile_stats := stats.per_profile.get(submission.primary.profile_key):
-            profile_stats.queued_for_submit += 1
-    return ImportPlan(submissions=keep, watermarks=watermarks, urls_seen=len(merged))
+    stats.profiles_total = len(profiles)
+    read_kwargs = {
+        "state": state,
+        "stats": stats,
+        "run_id": run_id,
+        "ignore_watermarks": ignore_watermarks,
+    }
+    if limit is None:
+        watermarks = await _emit_streaming(
+            profiles, planner=planner, shutdown=shutdown, emit=emit, **read_kwargs
+        )
+    else:
+        watermarks = await _emit_limited(
+            profiles,
+            planner=planner,
+            shutdown=shutdown,
+            emit=emit,
+            limit=limit,
+            **read_kwargs,
+        )
+    stats.reading_finished = True
+    return watermarks
 
 
-def _filter_merged(
-    merged: dict[str, UrlSubmission],
+async def _emit_streaming(
+    profiles: list[BrowserProfile],
     *,
-    submitted: dict[str, datetime],
-    permanently_rejected: set[str],
-    engine: ExclusionEngine,
+    planner: _Planner,
+    state: StateStore,
     stats: RunStats,
-    resubmit_revisits: bool,
-) -> tuple[list[UrlSubmission], list[tuple[str, SkipReason]]]:
-    keep: list[UrlSubmission] = []
-    skips: list[tuple[str, SkipReason]] = []
-    for url, submission in merged.items():
-        if url in permanently_rejected:
-            stats.previously_rejected += 1
-            continue
-        if (prior := submitted.get(url)) is not None and (
-            not resubmit_revisits or submission.last_visit_at <= prior
-        ):
-            stats.already_submitted += 1
-            continue
-        if reason := engine.check(url):
-            skips.append((url, reason))
-            stats.skipped += 1
-            stats.skip_reasons[str(reason.kind)] += 1
-            continue
-        keep.append(submission)
-    return keep, skips
+    run_id: int,
+    ignore_watermarks: bool,
+    shutdown: asyncio.Event,
+    emit: Emit,
+) -> dict[BrowserProfile, datetime]:
+    watermarks: dict[BrowserProfile, datetime] = {}
+    for profile in profiles:
+        if shutdown.is_set():
+            break
+        profile_max, enqueue = await _read_profile_into(
+            planner,
+            profile,
+            state=state,
+            stats=stats,
+            run_id=run_id,
+            ignore_watermarks=ignore_watermarks,
+        )
+        for url in enqueue:
+            await planner.emit_one(url, emit)
+        if profile_max is not None:
+            watermarks[profile] = profile_max
+    return watermarks
+
+
+async def _emit_limited(
+    profiles: list[BrowserProfile],
+    *,
+    planner: _Planner,
+    state: StateStore,
+    stats: RunStats,
+    run_id: int,
+    ignore_watermarks: bool,
+    shutdown: asyncio.Event,
+    emit: Emit,
+    limit: int,
+) -> dict[BrowserProfile, datetime]:
+    per_profile_max: dict[BrowserProfile, datetime] = {}
+    candidates: list[str] = []
+    for profile in profiles:
+        if shutdown.is_set():
+            break
+        profile_max, enqueue = await _read_profile_into(
+            planner,
+            profile,
+            state=state,
+            stats=stats,
+            run_id=run_id,
+            ignore_watermarks=ignore_watermarks,
+        )
+        candidates.extend(enqueue)
+        if profile_max is not None:
+            per_profile_max[profile] = profile_max
+    candidates.sort(key=lambda u: planner.merged[u].last_visit_at, reverse=True)
+    kept, dropped = candidates[:limit], candidates[limit:]
+    dropped_keys = {
+        source.watermark_key
+        for url in dropped
+        for source in planner.merged[url].sources
+    }
+    if dropped:
+        logger.info(
+            "limit {} reached; {} URLs deferred to a later run", limit, len(dropped)
+        )
+    for url in kept:
+        await planner.emit_one(url, emit)
+    return {
+        profile: profile_max
+        for profile, profile_max in per_profile_max.items()
+        if profile.watermark_key not in dropped_keys
+    }
+
+
+def _merge_profile(
+    merged: dict[str, UrlSubmission],
+    records: list[VisitRecord],
+    *,
+    classified: set[str],
+) -> tuple[datetime | None, list[str]]:
+    """Merge a profile's records; return its newest visit and unclassified URLs."""
+    profile_max: datetime | None = None
+    touched: list[str] = []
+    for record in records:
+        if profile_max is None or record.last_visit_at > profile_max:
+            profile_max = record.last_visit_at
+        _merge_record(merged, record)
+        if record.url not in classified:
+            touched.append(record.url)
+    return profile_max, touched
 
 
 class _Runner:
-    """Shared context for the concurrent submitter/poller/backlog tasks."""
+    """Shared context for the concurrent producer/submitter/poller/backlog tasks."""
 
     def __init__(
         self,
@@ -239,15 +428,25 @@ class _Runner:
         stats: RunStats,
         config: AppConfig,
         run_id: int,
+        profiles: list[BrowserProfile],
+        engine: ExclusionEngine,
+        ignore_watermarks: bool,
+        limit: int | None,
     ) -> None:
         self.client = client
         self.state = state
         self.stats = stats
         self.config = config
         self.run_id = run_id
+        self.profiles = profiles
+        self.engine = engine
+        self.ignore_watermarks = ignore_watermarks
+        self.limit = limit
         self.hostname = socket.gethostname()
         self.shutdown = asyncio.Event()
+        self.producer_done = asyncio.Event()
         self.queue: asyncio.Queue[UrlSubmission] = asyncio.Queue()
+        self.watermarks: dict[BrowserProfile, datetime] = {}
         self.pacer = AdaptivePacer(config=config.pacing, sleep=self.interruptible_sleep)
 
     async def interruptible_sleep(self, seconds: float) -> None:
@@ -255,12 +454,32 @@ class _Runner:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.shutdown.wait(), timeout=seconds)
 
+    async def producer(self) -> None:
+        """Stream profiles into the queue, then mark reading complete."""
+        try:
+            self.watermarks = await _stream_profiles(
+                self.profiles,
+                engine=self.engine,
+                state=self.state,
+                stats=self.stats,
+                config=self.config,
+                run_id=self.run_id,
+                ignore_watermarks=self.ignore_watermarks,
+                limit=self.limit,
+                shutdown=self.shutdown,
+                emit=self._emit,
+            )
+        finally:
+            self.producer_done.set()
+
+    async def _emit(self, submission: UrlSubmission) -> None:
+        self.queue.put_nowait(submission)
+
     async def submitter(self) -> None:
         """Drain the queue through the pacer, recording every outcome."""
         while not self.shutdown.is_set():
-            try:
-                item = self.queue.get_nowait()
-            except asyncio.QueueEmpty:
+            item = await self._next_item()
+            if item is None:
                 break
             self.stats.current_interval = self.pacer.effective_interval
             await self.pacer.wait()
@@ -269,6 +488,17 @@ class _Runner:
                 break
             await self._submit_one(item)
         self.stats.submitter_finished = True
+
+    async def _next_item(self) -> UrlSubmission | None:
+        """Pull the next queued URL, waiting for the producer while it reads."""
+        while not self.shutdown.is_set():
+            try:
+                return self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self.producer_done.is_set():
+                    return None
+                await self.interruptible_sleep(0.1)
+        return None
 
     async def _submit_one(self, item: UrlSubmission) -> None:
         try:
@@ -283,6 +513,7 @@ class _Runner:
             if profile_stats := self.stats.per_profile.get(item.primary.profile_key):
                 profile_stats.submitted += 1
             self.stats.add_event(f"rejected {_short(item.url)}: {exc}")
+            logger.info("rejected (422) {}: {}", item.url, exc)
             await self.state.record_submission(
                 url=item.url,
                 outcome="rejected",
@@ -303,6 +534,7 @@ class _Runner:
         match outcome:
             case Accepted(page_id=page_id):
                 self.stats.accepted += 1
+                logger.debug("accepted (202) {} -> {}", item.url, page_id)
                 await self.state.record_submission(
                     url=item.url,
                     outcome="queued",
@@ -315,6 +547,7 @@ class _Runner:
                 self.stats.revisits += 1
                 if revisit.content_hash_differs:
                     self.stats.add_event(f"content changed: {_short(item.url)}")
+                logger.debug("revisit (200) {} -> {} ({})", item.url, page_id, status)
                 await self.state.record_submission(
                     url=item.url,
                     outcome="revisit",
@@ -328,6 +561,7 @@ class _Runner:
                 self.stats.add_event(
                     f"blacklisted by server ({pattern}): {_short(item.url)}"
                 )
+                logger.info("blacklisted (403) {} by {}", item.url, pattern)
                 await self.state.record_submission(
                     url=item.url,
                     outcome="blacklisted",
@@ -341,11 +575,22 @@ class _Runner:
         if item.attempts >= self.config.pacing.max_attempts:
             self.stats.errors += 1
             self.stats.add_event(f"gave up on {_short(item.url)}: {exc}")
+            logger.error(
+                "gave up on {} after {} attempts: {}", item.url, item.attempts, exc
+            )
         else:
+            self.stats.retries += 1
             self.queue.put_nowait(item)
             self.stats.add_event(
                 f"retry {item.attempts}/{self.config.pacing.max_attempts}: "
                 f"{_short(item.url)}"
+            )
+            logger.warning(
+                "retry {}/{} {}: {}",
+                item.attempts,
+                self.config.pacing.max_attempts,
+                item.url,
+                exc,
             )
 
     async def poller(self) -> None:
@@ -386,6 +631,7 @@ class _Runner:
                     self.stats.add_event(
                         f"dead: {page_id} ({status.last_error or 'unknown error'})"
                     )
+                    logger.info("dead: {} ({})", page_id, status.last_error)
                 case _:
                     pass
             await asyncio.sleep(0.1)
@@ -412,10 +658,8 @@ def _runtime_error_from_group(group: ExceptionGroup) -> RuntimeError | None:
     return error if isinstance(error, RuntimeError) else None
 
 
-async def _run_tasks(runner: _Runner, plan: ImportPlan, console: Console) -> bool:
-    """Run submitter, poller, backlog watcher, and the live UI. True if interrupted."""
-    for item in plan.submissions:
-        runner.queue.put_nowait(item)
+async def _run_tasks(runner: _Runner, console: Console) -> bool:
+    """Run producer, submitter, poller, backlog + live UI; True if interrupted."""
     loop = asyncio.get_running_loop()
     tasks: list[asyncio.Task[None]] = []
     presses = 0
@@ -433,20 +677,33 @@ async def _run_tasks(runner: _Runner, plan: ImportPlan, console: Console) -> boo
                 task.cancel()
 
     loop.add_signal_handler(signal.SIGINT, on_sigint)
-    progress, task_id = build_progress(total=runner.stats.total_to_submit)
+    progress, reading_id, submit_id = build_progress()
     try:
         with Live(console=console, refresh_per_second=8) as live:
 
+            def paint() -> None:
+                stats = runner.stats
+                stats.queue_depth = runner.queue.qsize()
+                progress.update(
+                    reading_id,
+                    total=max(stats.profiles_total, 1),
+                    completed=stats.profiles_read,
+                )
+                progress.update(
+                    submit_id, total=stats.total_to_submit, completed=stats.processed
+                )
+                live.update(render_dashboard(stats, progress))
+
             async def refresh() -> None:
                 while True:
-                    progress.update(task_id, completed=runner.stats.processed)
-                    live.update(render_dashboard(runner.stats, progress))
+                    paint()
                     await asyncio.sleep(0.25)
 
             refresh_task = asyncio.create_task(refresh())
             try:
                 try:
                     async with asyncio.TaskGroup() as tg:
+                        tasks.append(tg.create_task(runner.producer()))
                         tasks.append(tg.create_task(runner.submitter()))
                         tasks.append(tg.create_task(runner.poller()))
                         tasks.append(tg.create_task(runner.backlog_watcher()))
@@ -458,14 +715,46 @@ async def _run_tasks(runner: _Runner, plan: ImportPlan, console: Console) -> boo
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await refresh_task
-                progress.update(task_id, completed=runner.stats.processed)
-                live.update(render_dashboard(runner.stats, progress))
+                paint()
     finally:
         loop.remove_signal_handler(signal.SIGINT)
     return (
         runner.shutdown.is_set()
         or runner.stats.processed < runner.stats.total_to_submit
     )
+
+
+async def _dry_run(
+    *,
+    profiles: list[BrowserProfile],
+    engine: ExclusionEngine,
+    state: StateStore,
+    stats: RunStats,
+    config: AppConfig,
+    run_id: int,
+    ignore_watermarks: bool,
+    limit: int | None,
+    console: Console,
+) -> None:
+    collected: list[UrlSubmission] = []
+
+    async def collect(submission: UrlSubmission) -> None:
+        collected.append(submission)
+
+    with console.status("reading browser history..."):
+        await _stream_profiles(
+            profiles,
+            engine=engine,
+            state=state,
+            stats=stats,
+            config=config,
+            run_id=run_id,
+            ignore_watermarks=ignore_watermarks,
+            limit=limit,
+            shutdown=asyncio.Event(),
+            emit=collect,
+        )
+    print_dry_run_report(console, stats, collected)
 
 
 async def run_import(
@@ -483,11 +772,10 @@ async def run_import(
     async with StateStore(config.state.db_path) as state:
         run_id = await state.begin_run()
         interrupted = True
-        urls_seen = 0
         try:
-            with console.status("reading browser history..."):
-                plan = await _build_plan(
-                    profiles,
+            if dry_run:
+                await _dry_run(
+                    profiles=profiles,
                     engine=engine,
                     state=state,
                     stats=stats,
@@ -495,10 +783,8 @@ async def run_import(
                     run_id=run_id,
                     ignore_watermarks=ignore_watermarks,
                     limit=limit,
+                    console=console,
                 )
-            urls_seen = plan.urls_seen
-            if dry_run:
-                print_dry_run_report(console, stats, plan.submissions)
                 interrupted = False
                 return stats
             token = config.server.resolve_token()
@@ -516,17 +802,32 @@ async def run_import(
                     stats=stats,
                     config=config,
                     run_id=run_id,
+                    profiles=profiles,
+                    engine=engine,
+                    ignore_watermarks=ignore_watermarks,
+                    limit=limit,
                 )
-                interrupted = await _run_tasks(runner, plan, console)
+                logger.info("run {} started: {} profile(s)", run_id, len(profiles))
+                interrupted = await _run_tasks(runner, console)
             if not interrupted and stats.errors == 0:
-                for profile, watermark in plan.watermarks.items():
+                for profile, watermark in runner.watermarks.items():
                     await state.set_watermark(profile, watermark)
             print_summary(console, stats, interrupted=interrupted)
+            logger.info(
+                "run {} done: submitted={} accepted={} revisits={} errors={} "
+                "interrupted={}",
+                run_id,
+                stats.submitted,
+                stats.accepted,
+                stats.revisits,
+                stats.errors,
+                interrupted,
+            )
         finally:
             await state.finish_run(
                 run_id,
                 interrupted=interrupted,
-                urls_seen=urls_seen,
+                urls_seen=stats.unique_urls,
                 submitted=stats.accepted,
                 revisits=stats.revisits,
                 blacklisted=stats.blacklisted,

@@ -120,6 +120,71 @@ def profile_for(path: Path, family: BrowserFamily) -> BrowserProfile:
     )
 
 
+def _chromium_install(
+    base_dir: Path, profiles: dict[str, str], *, url_prefix: str
+) -> None:
+    """Create a Chromium user-data dir with a Local State and History files."""
+    for profile_dir in profiles:
+        (base_dir / profile_dir).mkdir(parents=True)
+        make_chromium_db(
+            base_dir / profile_dir / "History",
+            [(f"{url_prefix}/{profile_dir}", "Page", [T1], 0)],
+        )
+    (base_dir / "Local State").write_text(
+        json.dumps(
+            {"profile": {"info_cache": {d: {"name": n} for d, n in profiles.items()}}}
+        )
+    )
+
+
+def _firefox_install(firefox_dir: Path, *, url: str) -> None:
+    """Create a Firefox dir with profiles.ini and one places.sqlite profile."""
+    profile_path = firefox_dir / "Profiles" / "abc123.default-release"
+    profile_path.mkdir(parents=True)
+    make_firefox_db(profile_path / "places.sqlite", [(url, "Firefox", [T1], 0)])
+    (firefox_dir / "profiles.ini").write_text(
+        "[Profile0]\n"
+        "Name=default-release\n"
+        "IsRelative=1\n"
+        "Path=Profiles/abc123.default-release\n"
+    )
+
+
+@pytest.fixture
+def fake_linux_home(tmp_path: Path) -> Path:
+    """A home tree mirroring a Linux browser layout."""
+    home = tmp_path / "home"
+    config = home / ".config"
+
+    _chromium_install(
+        config / "google-chrome",
+        {"Default": "Harold", "Profile 1": "Work"},
+        url_prefix="https://chrome.example",
+    )
+    _chromium_install(
+        config / "BraveSoftware" / "Brave-Browser",
+        {"Default": "Brave"},
+        url_prefix="https://brave.example",
+    )
+    _chromium_install(
+        config / "chromium",
+        {"Default": "Chromium"},
+        url_prefix="https://chromium.example",
+    )
+
+    # An Electron app: Local State without info_cache, no History file.
+    electron = config / "SomeElectronApp"
+    electron.mkdir(parents=True)
+    (electron / "Local State").write_text(json.dumps({"os_crypt": {}}))
+
+    _firefox_install(home / ".mozilla" / "firefox", url="https://firefox.example")
+    _firefox_install(
+        home / "snap" / "firefox" / "common" / ".mozilla" / "firefox",
+        url="https://snap-firefox.example",
+    )
+    return home
+
+
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
     """A home directory tree mirroring real browser layouts on this machine."""

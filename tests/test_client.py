@@ -1,5 +1,7 @@
 """RefinderyClient behavior against a mocked API."""
 
+import re
+
 import httpx2
 import pytest
 from pytest_httpx2 import HTTPXMock
@@ -143,6 +145,24 @@ async def test_wait_ready_ok(httpx2_mock: HTTPXMock) -> None:
         await client.wait_ready()
 
 
+async def test_wait_ready_recovers_from_transport_error(
+    httpx2_mock: HTTPXMock,
+) -> None:
+    httpx2_mock.add_exception(
+        exception=httpx2.ConnectError("backend is starting"),
+        method="GET",
+        url=endpoint("/readyz"),
+    )
+    httpx2_mock.add_response(
+        method="GET",
+        url=endpoint("/readyz"),
+        status_code=200,
+        json={"status": "ready"},
+    )
+    async with make_client() as client:
+        await client.wait_ready(poll_interval=0)
+
+
 async def test_wait_ready_times_out(httpx2_mock: HTTPXMock) -> None:
     httpx2_mock.add_response(
         method="GET",
@@ -167,6 +187,7 @@ async def test_pending_job_count(httpx2_mock: HTTPXMock) -> None:
 
     httpx2_mock.add_callback(
         check_request,
+        url=re.compile(rf"^{re.escape(endpoint('/v1/jobs'))}(?:\?.*)?$"),
         method="GET",
     )
     async with make_client() as client:
