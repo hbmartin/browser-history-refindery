@@ -1,0 +1,115 @@
+[project]
+site_name = "Refindery Browser History Importer"
+site_description = "Import macOS browser history into a Refindery backend safely and incrementally."
+site_author = "Refindery contributors"
+site_url = "https://hbmartin.github.io/browser-history-refindery/"
+copyright = "Copyright &copy; 2026 Refindery contributors"
+docs_dir = "docs"
+site_dir = "site"
+repo_url = "https://github.com/hbmartin/browser-history-refindery"
+repo_name = "hbmartin/browser-history-refindery"
+edit_uri = "edit/main/docs/"
+nav = [
+    { "Home" = "index.md" },
+    { "Getting started" = "getting-started.md" },
+    { "User guide" = [
+        { "Importing history" = "guide/importing.md" },
+        { "Privacy and exclusions" = "guide/privacy.md" },
+        { "Status and deletion" = "guide/status-and-deletion.md" },
+    ] },
+    { "Reference" = [
+        { "CLI" = "reference/cli.md" },
+        { "Configuration" = "reference/configuration.md" },
+        { "Browser compatibility" = "reference/browsers.md" },
+        { "Troubleshooting" = "reference/troubleshooting.md" },
+    ] },
+    { "Maintainers" = [
+        { "Architecture and backend contract" = "maintainers/architecture.md" },
+        { "Development" = "maintainers/development.md" },
+    ] },
+]
+
+[project.theme]
+variant = "modern"
+language = "en"
+features = [
+    "content.action.edit",
+    "content.action.view",
+    "content.code.annotate",
+    "content.code.copy",
+    "content.code.select",
+    "content.tooltips",
+    "navigation.footer",
+    "navigation.path",
+    "navigation.sections",
+    "navigation.top",
+    "navigation.tracking",
+    "search.highlight",
+    "toc.follow",
+]
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[project.markdown_extensions.abbr]
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.def_list]
+[project.markdown_extensions.footnotes]
+[project.markdown_extensions.md_in_html]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.arithmatex]
+generic = true
+
+[project.markdown_extensions.pymdownx.betterem]
+[project.markdown_extensions.pymdownx.caret]
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.emoji]
+emoji_generator = "zensical.extensions.emoji.to_svg"
+emoji_index = "zensical.extensions.emoji.twemoji"
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.keys]
+[project.markdown_extensions.pymdownx.magiclink]
+[project.markdown_extensions.pymdownx.mark]
+[project.markdown_extensions.pymdownx.smartsymbols]
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+    { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+combine_header_slug = true
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
+
+[project.markdown_extensions.pymdownx.tilde]
