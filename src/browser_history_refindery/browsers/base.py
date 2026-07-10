@@ -30,8 +30,13 @@ class BrowserProfile:
 
     @property
     def key(self) -> str:
-        """Stable identifier used for stats and watermark lookups."""
+        """Stable identifier used for per-profile stats."""
         return f"{self.browser_id}:{self.profile_dir}"
+
+    @property
+    def watermark_key(self) -> tuple[str, str]:
+        """Persistent identity used for incremental-import watermarks."""
+        return self.browser_id, str(self.history_path)
 
     @property
     def display(self) -> str:

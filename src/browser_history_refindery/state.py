@@ -304,7 +304,7 @@ class StateStore:
             SELECT last_visit_at FROM profile_watermarks
             WHERE browser_id = ? AND history_path = ?
             """,
-            (profile.browser_id, str(profile.history_path)),
+            profile.watermark_key,
         )
         row = await cursor.fetchone()
         return datetime.fromisoformat(row[0]) if row else None
@@ -324,8 +324,7 @@ class StateStore:
                 updated_at = excluded.updated_at
             """,
             (
-                profile.browser_id,
-                str(profile.history_path),
+                *profile.watermark_key,
                 profile.profile_name,
                 last_visit_at.isoformat(),
                 _now_iso(),
