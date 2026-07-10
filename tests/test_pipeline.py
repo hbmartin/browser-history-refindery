@@ -14,7 +14,7 @@ import pytest
 from pytest_httpx2 import HTTPXMock
 from rich.console import Console
 
-from browser_history_refindery.api_client import Accepted, AuthError
+from browser_history_refindery.api_client import Accepted, AuthError, Revisit
 from browser_history_refindery.api_models import IngestPageRequest
 from browser_history_refindery.browsers import BrowserFamily
 from browser_history_refindery.browsers.base import VisitRecord, to_chromium_us
@@ -273,6 +273,48 @@ def test_merge_profile_keeps_query_variants_distinct(tmp_path: Path) -> None:
     assert set(planner.merged) == set(urls)
 
 
+def test_merge_profile_does_not_requeue_an_already_queued_revisit(
+    tmp_path: Path,
+) -> None:
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    url = "https://queued-revisit.example/"
+    planner = _Planner(
+        engine=ExclusionEngine(AppConfig().exclusions),
+        stats=RunStats(),
+        submitted={},
+        permanently_rejected=set(),
+        resubmit_revisits=True,
+    )
+    initial = VisitRecord(
+        url=url,
+        title="Initial",
+        visit_count=1,
+        first_visit_at=T0,
+        last_visit_at=T0,
+        profile=profile,
+    )
+    newer = VisitRecord(
+        url=url,
+        title="Newer",
+        visit_count=1,
+        first_visit_at=T2,
+        last_visit_at=T2,
+        profile=profile,
+    )
+
+    _, touched = planner.merge_profile([initial])
+    planner.classify_profile(touched)
+    submission = planner.merged[url]
+    submission.last_submitted_visit_at = T0
+    submission.queued = True
+
+    _, reconsidered = planner.merge_profile([newer])
+
+    assert reconsidered == []
+    assert submission.last_visit_at == T2
+    assert submission.queued is True
+
+
 def test_log_url_hides_query_but_preserves_distinct_fingerprints() -> None:
     first = "https://example.test/page?token=secret-one#private"
     second = "https://example.test/page?token=secret-two#private"
@@ -519,6 +561,67 @@ async def test_submit_persists_the_attempted_snapshot(tmp_path: Path) -> None:
     assert item.last_visit_at == T2
     assert observed[url] == T0
     assert runner.queue.get_nowait() is item
+    assert item.queued is True
+    assert runner.stats.total_to_submit == 1
+
+
+async def test_submit_requeues_on_revisit_when_newer_visit_appears(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.import_.resubmit_revisits = True
+    url = "https://revisit-requeue.example/"
+    first_profile = profile_for(tmp_path / "first-History", BrowserFamily.CHROMIUM)
+    later_profile = profile_for(tmp_path / "later-History", BrowserFamily.SAFARI)
+    initial = VisitRecord(
+        url=url,
+        title="Initial",
+        visit_count=1,
+        first_visit_at=T0,
+        last_visit_at=T0,
+        profile=first_profile,
+    )
+    later = VisitRecord(
+        url=url,
+        title="Later",
+        visit_count=1,
+        first_visit_at=T2,
+        last_visit_at=T2,
+        profile=later_profile,
+    )
+    merged: dict[str, UrlSubmission] = {}
+    _merge_record(merged, initial)
+    item = merged[url]
+
+    class RevisitClient:
+        async def ingest_url(self, _request: IngestPageRequest) -> Revisit:
+            _merge_record(merged, later)
+            await asyncio.sleep(0)
+            return Revisit(
+                page_id="pg_revisit", status="indexed", content_hash_differs=False
+            )
+
+    async with StateStore(config.state.db_path) as state:
+        run_id = await state.begin_run()
+        runner = _Runner(
+            client=cast("Any", RevisitClient()),
+            state=state,
+            stats=RunStats(),
+            config=config,
+            run_id=run_id,
+            profiles=[],
+            engine=ExclusionEngine(config.exclusions),
+            ignore_watermarks=False,
+            limit=None,
+        )
+        await runner._submit_one(item)  # noqa: SLF001 - targeted runner regression
+        observed = await state.load_submission_visit_times()
+
+    assert runner.stats.revisits == 1
+    assert item.last_submitted_visit_at == T0
+    assert observed[url] == T0
+    assert runner.queue.get_nowait() is item
+    assert item.queued is True
     assert runner.stats.total_to_submit == 1
 
 
