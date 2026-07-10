@@ -77,6 +77,7 @@ class UrlSubmission:
     sources: list[SourceInfo] = field(default_factory=list)
     attempts: int = 0
     last_submitted_visit_at: datetime | None = None
+    queued: bool = False
 
     def snapshot(self) -> Self:
         """Freeze the current merged shape for one HTTP attempt and its result."""
@@ -230,6 +231,13 @@ class _Planner:
                 touched_urls.add(record.url)
                 continue
             submission = self.merged[record.url]
+            if submission.queued:
+                continue
+            # A URL is in exactly one of two reconsideration states: submitted
+            # this run (``last_submitted_visit_at`` set, never in ``already``) or
+            # skipped as already-submitted before this run (in ``already``, never
+            # submitted this run). The two branches below stay mutually exclusive,
+            # so a re-touch can't both re-queue and double-count a stat.
             if (
                 self.resubmit_revisits
                 and submission.last_submitted_visit_at is not None
@@ -244,7 +252,7 @@ class _Planner:
                 self.resubmit_revisits
                 and record.url in self.already
                 and prior is not None
-                and self.merged[record.url].last_visit_at > prior
+                and submission.last_visit_at > prior
             ):
                 self.classified.remove(record.url)
                 self.already.remove(record.url)
@@ -515,7 +523,15 @@ class _Runner:
             self.producer_done.set()
 
     async def _emit(self, submission: UrlSubmission) -> None:
-        self.queue.put_nowait(submission)
+        self._enqueue(submission)
+
+    def _enqueue(self, item: UrlSubmission, *, reserved: bool = False) -> bool:
+        """Queue an item once, or restore one reserved by the submitter."""
+        if item.queued and not reserved:
+            return False
+        item.queued = True
+        self.queue.put_nowait(item)
+        return True
 
     async def submitter(self) -> None:
         """Drain the queue through the pacer, recording every outcome."""
@@ -526,7 +542,7 @@ class _Runner:
             self.stats.current_interval = self.pacer.effective_interval
             await self.pacer.wait()
             if self.shutdown.is_set():
-                self.queue.put_nowait(item)
+                self._enqueue(item, reserved=True)
                 break
             await self._submit_one(item)
         self.stats.submitter_finished = True
@@ -543,6 +559,7 @@ class _Runner:
         return None
 
     async def _submit_one(self, item: UrlSubmission) -> None:
+        item.queued = False
         attempted = item.snapshot()
         try:
             outcome = await self.client.ingest_url(attempted.to_request(self.hostname))
@@ -578,8 +595,8 @@ class _Runner:
             if (
                 self.config.import_.resubmit_revisits
                 and item.last_visit_at > attempted.last_visit_at
+                and self._enqueue(item)
             ):
-                self.queue.put_nowait(item)
                 self.stats.total_to_submit += 1
                 if profile_stats := self.stats.per_profile.get(
                     item.primary.profile_key
@@ -646,7 +663,7 @@ class _Runner:
             )
         else:
             self.stats.retries += 1
-            self.queue.put_nowait(item)
+            self._enqueue(item)
             display_url = _log_url(item.url)
             self.stats.add_event(
                 f"retry {item.attempts}/{self.config.pacing.max_attempts}: "
