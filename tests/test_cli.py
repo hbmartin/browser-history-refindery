@@ -51,7 +51,8 @@ db_path = "{tmp_path / "state.sqlite3"}"
     )
     assert result.exit_code == 0
     assert "Dry run" in result.output
-    assert "would submit" in result.output
+    assert "eligible pages" in result.output
+    assert "Incremental resource estimate" in result.output
 
 
 def test_import_db_requires_browser(tmp_path):

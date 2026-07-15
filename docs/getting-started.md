@@ -1,7 +1,7 @@
 # Getting started
 
 This guide installs the command, inspects the browser profiles visible on your
-Mac, runs a local-only preview, and starts the first import.
+Mac, previews and estimates the import, and starts the first real submission.
 
 ## Prerequisites
 
@@ -80,12 +80,21 @@ $ refindery-import import --dry-run
 ```
 
 All discovered profiles are initially checked. Adjust the selection, then
-confirm it. The report shows how many URLs would be submitted, excluded, or
-deduplicated and previews the ten newest eligible URLs.
+confirm it. The report shows the total eligible pages, pages per Refinder-style
+domain, estimated incremental disk use and indexing cost, excluded and
+deduplicated counts, estimate coverage, and the ten newest eligible URLs.
 
-A dry run does not contact Refindery and does not need a token. It can create
-the default config and local state database, and it records the run and its
-local exclusion results.
+A non-empty dry run probes Refindery and, with a valid token and a server that
+advertises `batch_estimate`, sends the same eligible URL metadata as an import.
+Refindery may fetch and extract those pages to estimate them, but it must not
+persist pages or invoke paid providers. Configure the token before the dry run
+for live estimates. If live estimation is unavailable, the importer uses the
+last configuration-aware fallback profile cached for that server; before the
+first successful estimate, storage and cost are reported as unavailable.
+
+The command can create the default config and local state database, record the
+run and exclusions, and update the estimation-profile cache. It never records
+a successful submission or advances profile watermarks.
 
 For an unattended preview of every discovered profile:
 

@@ -31,14 +31,17 @@ mkdir -p ~/.config/refindery-import
 cd ~/.config/refindery-import
 
 refindery-import list-profiles
-refindery-import import --dry-run
-
 export REFINDERY_AUTH_TOKEN="replace-with-your-token"
+refindery-import import --dry-run
 refindery-import
 ```
 
 The first import command creates a commented `config.toml`. Local progress and
 deduplication state are stored in `refindery_state.sqlite3`.
+
+Dry runs submit nothing, but they ask Refindery to estimate the selected pages'
+incremental disk use and configured indexing cost. Refindery may fetch those
+pages while estimating them.
 
 Safari history requires Full Disk Access for the terminal application under
 **System Settings → Privacy & Security → Full Disk Access**. Restart the

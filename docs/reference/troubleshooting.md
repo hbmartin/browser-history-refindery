@@ -2,7 +2,8 @@
 
 Start with `refindery-import list-profiles` and an interactive `--dry-run`.
 Those commands separate browser-reading problems from backend and token
-problems.
+problems. For questions about normal behavior, recovery, and local state, see
+the [frequently asked questions](faq.md).
 
 ## No browser history databases found
 
@@ -81,8 +82,9 @@ inspect its last error and the Refindery worker logs.
 
 Dry run means no backend submission, not a read-only local process. The command
 can create `config.toml`, initialize or migrate the state database, add a run,
-and record exclusion results. It does not record submissions or advance
-watermarks.
+record exclusion results, and cache Refindery's fallback estimation profile. A
+non-empty plan also probes Refindery and may ask it to fetch candidate pages for
+estimation. It does not record submissions or advance watermarks.
 
 ## `--full` did not resend old URLs
 

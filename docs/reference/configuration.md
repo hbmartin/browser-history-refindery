@@ -17,6 +17,9 @@ base_url = "http://127.0.0.1:8000"
 request_timeout = 30.0
 ready_timeout = 60.0
 
+[submit]
+batch_size = 50
+
 [pacing]
 base_interval = 1.0
 floor = 0.5
@@ -30,7 +33,7 @@ queue_slowdown_factor = 2.0
 
 [poller]
 interval = 5.0
-batch_size = 20
+batch_size = 100
 drain_grace = 60.0
 
 [exclusions]
@@ -67,7 +70,15 @@ $ export REFINDERY_AUTH_TOKEN="replace-with-your-token"
 ```
 
 A real import, status request that contacts the backend, or blacklist operation
-fails if neither source contains a token. Dry runs do not resolve a token.
+fails if neither source contains a token. A dry run attempts to resolve the
+token for live estimation, but missing authentication degrades to the cached
+profile or unavailable totals instead of failing the command.
+
+## `[submit]`
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `batch_size` | Integer | `50` | Pages per ingest or dry-run estimate request (1–100). |
 
 ## `[pacing]`
 
@@ -91,7 +102,7 @@ never exceeds `ceiling`.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `interval` | Float | `5.0` | Delay between page-status polling rounds. |
-| `batch_size` | Integer | `20` | Maximum page IDs loaded for one polling round. |
+| `batch_size` | Integer | `100` | Maximum page IDs loaded for one polling round (1–500). |
 | `drain_grace` | Float | `60.0` | Time to keep polling after all submissions finish. |
 
 ## `[exclusions]`
@@ -112,13 +123,15 @@ evaluation order, and the data sent for allowed URLs.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `db_path` | Path string | `refindery_state.sqlite3` | Local SQLite database used for runs, submissions, skips, statuses, and watermarks. |
+| `db_path` | Path string | `refindery_state.sqlite3` | Local SQLite database used for runs, submissions, skips, statuses, watermarks, and cached estimation profiles. |
 
 The database uses WAL mode, so `-wal` and `-shm` sidecars may appear while it is
 open. Keep all of them private and do not delete or move them during a run.
 
 The importer migrates older supported state schemas in place. It refuses to
 open a database with a schema version newer than the running build supports.
+Fallback estimation profiles are keyed by normalized `server.base_url`, so a
+profile learned from one Refindery deployment is never used for another.
 
 ## `[import]`
 

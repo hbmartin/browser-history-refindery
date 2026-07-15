@@ -113,13 +113,21 @@ class PacingConfig(BaseModel):
         return self
 
 
+class SubmitConfig(BaseModel):
+    """Batch-ingest tuning for the submitter (Refindery >= 0.2.0)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(default=50, ge=1, le=100)
+
+
 class PollerConfig(BaseModel):
     """Background page-status poller tuning."""
 
     model_config = ConfigDict(extra="forbid")
 
     interval: float = Field(default=5.0, gt=0.0)
-    batch_size: int = Field(default=20, ge=1)
+    batch_size: int = Field(default=100, ge=1, le=500)
     drain_grace: float = Field(default=60.0, ge=0.0)
 
 
@@ -213,6 +221,7 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     server: ServerConfig = Field(default_factory=ServerConfig)
+    submit: SubmitConfig = Field(default_factory=SubmitConfig)
     pacing: PacingConfig = Field(default_factory=PacingConfig)
     poller: PollerConfig = Field(default_factory=PollerConfig)
     exclusions: ExclusionsConfig = Field(default_factory=ExclusionsConfig)
@@ -242,22 +251,26 @@ base_url = "http://127.0.0.1:8000"
 # request_timeout = 30.0
 # ready_timeout = 60.0
 
+[submit]
+# Batch ingest (POST /v1/pages/batch). Requires Refindery >= 0.2.0.
+# batch_size = 50             # URLs per request (1-100)
+
 [pacing]
-# Adaptive cool-off between URL submissions, in seconds.
+# Adaptive cool-off between submission batches, in seconds.
 # base_interval = 1.0
 # floor = 0.5
 # ceiling = 60.0
 # backoff_factor = 2.0        # applied on timeouts / 5xx / connection errors
 # recovery_factor = 0.9       # applied on each success
-# max_attempts = 5            # per-URL retries before counting an error
+# max_attempts = 5            # per-URL retries before an error (whole batch retried)
 # queue_poll_interval = 15.0  # how often to check the server's pending-job backlog
 # queue_depth_threshold = 100 # slow down when the backlog exceeds this
 # queue_slowdown_factor = 2.0
 
 [poller]
-# Background page-status polling.
+# Background page-status polling (POST /v1/pages/status/batch).
 # interval = 5.0
-# batch_size = 20
+# batch_size = 100            # page IDs per status request (1-500)
 # drain_grace = 60.0          # seconds to keep polling after submission finishes
 
 [exclusions]

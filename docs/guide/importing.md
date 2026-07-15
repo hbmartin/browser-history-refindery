@@ -1,8 +1,10 @@
 # Importing history
 
-An import has two phases: first the complete submission plan is built locally,
-then eligible URLs are delivered newest-first while background tasks monitor
-Refindery.
+An import reads, merges, filters, and queues one browser profile at a time while
+eligible URLs from earlier profiles are submitted. Background tasks monitor
+Refindery throughout delivery. A limited run is different: it reads every
+profile before submission so the newest URLs across the complete selection can
+win the available slots.
 
 ## Select input profiles
 
@@ -35,32 +37,63 @@ Valid families are `chromium`, `firefox`, and `safari`. `--db` without
 The file is still copied to a temporary directory before it is opened. The
 importer does not modify the source database.
 
-## How a plan is built
+## How work is planned
 
 For each selected profile, the importer:
 
 1. reads visits newer than the profile watermark, unless `--full` is set;
 2. aggregates each URL's visit count and first and last visit timestamps;
-3. merges the same URL across all selected profiles;
+3. merges the same URL with any matching records read so far;
 4. removes terminal submissions already recorded in local state;
-5. applies local exclusion rules; and
-6. sorts eligible URLs by most recent visit, newest first.
+5. applies local exclusion rules;
+6. sorts that profile's eligible URLs by most recent visit; and
+7. queues them while the next profile is read.
 
-When the same URL appears in several profiles, Refindery receives one request
-with combined visit metadata and a per-profile `sources` list.
+When the same URL appears in several profiles before its request starts,
+Refindery receives combined visit metadata and a per-profile `sources` list. In
+an unbounded streaming run, a request can finish before a later profile reveals
+another sighting. The completed request retains its original snapshot. With
+`import.resubmit_revisits = true`, a newer later sighting is queued as a
+revisit.
+
+`--limit` and `--dry-run` finish reading all profiles before their final output.
+A limited run globally sorts the merged candidates newest-first, applies the
+limit, and then starts submission.
 
 ## Preview without submitting
 
-`--dry-run` performs the read, merge, deduplication, filtering, sorting, and
-reporting phases without resolving a bearer token or contacting Refindery:
+`--dry-run` performs the read, merge, deduplication, filtering, and reporting
+phases, then asks Refindery to estimate the eligible pages:
 
 ```console
 $ refindery-import import --dry-run --all
 ```
 
-It may still create `config.toml` and the local state database and record the
-run and excluded URLs. It never records a successful submission or advances a
-profile watermark.
+The report includes:
+
+- total eligible pages after `--limit`, when present;
+- every domain and its page count, grouping lowercase hostnames after removing
+  only a leading `www.`;
+- incremental estimated disk storage;
+- total configured indexing cost in USD and its component breakdown; and
+- counts covered by live estimates, the cached fallback profile, zero-impact
+  server outcomes, or no available estimate.
+
+For non-empty plans the importer probes `GET /readyz` once. When Refindery
+advertises `batch_estimate` and a bearer token is configured, the importer sends
+the same page metadata as an ingest request to
+`POST /v1/pages/estimate/batch`. Refindery may fetch and extract the current
+page, but the estimation contract forbids persistence and paid-provider calls.
+
+If readiness, capability, authentication, or an estimate batch fails, only the
+unresolved pages use the latest configuration-aware fallback profile cached for
+that `server.base_url`. Storage or cost remains explicitly unavailable when no
+profile exists or a configured paid component has no price. Estimation failures
+do not make the dry run exit unsuccessfully.
+
+A dry run may create `config.toml`, migrate the local state database, record the
+run and excluded URLs, and refresh the estimation-profile cache. It never
+records a successful submission or advances a profile watermark.
 
 ## Limit a run
 
@@ -130,6 +163,9 @@ the local state database. Run the importer again to resume.
 
 Press ++ctrl+c++ a second time to force cancellation. An interrupted run never
 advances profile watermarks.
+
+For abrupt termination, the in-flight delivery window, and exact restart
+behavior, see [What happens if an import is interrupted or killed?](../reference/faq.md#what-happens-if-an-import-is-interrupted-or-killed).
 
 ## Follow indexing status
 

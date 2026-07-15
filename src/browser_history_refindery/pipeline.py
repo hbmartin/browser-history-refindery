@@ -31,15 +31,21 @@ from rich.live import Live
 
 from browser_history_refindery.api_client import (
     Accepted,
+    BatchOutcome,
     Blacklisted,
     RefinderyClient,
+    Rejected,
+    RequiresBatchApiError,
     Revisit,
     ServerError,
-    ValidationRejectedError,
 )
-from browser_history_refindery.api_models import IngestPageRequest
+from browser_history_refindery.api_models import (
+    IngestPageRequest,
+    PageStatusBatchFoundResult,
+)
 from browser_history_refindery.browsers import BrowserProfile, VisitRecord, read_profile
 from browser_history_refindery.config import AppConfig
+from browser_history_refindery.estimation import estimate_pages
 from browser_history_refindery.filters import ExclusionEngine, SkipReason
 from browser_history_refindery.logsetup import logger
 from browser_history_refindery.pacer import AdaptivePacer
@@ -53,6 +59,13 @@ from browser_history_refindery.ui import (
 )
 
 Emit = Callable[["UrlSubmission"], Awaitable[None]]
+
+
+class _MissingBatchResultError(RuntimeError):
+    """A batch response omitted an item the server should have echoed back."""
+
+    def __init__(self, index: int) -> None:
+        super().__init__(f"batch response omitted result for item {index}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,17 +547,18 @@ class _Runner:
         return True
 
     async def submitter(self) -> None:
-        """Drain the queue through the pacer, recording every outcome."""
+        """Drain the queue in batches through the pacer, recording outcomes."""
         while not self.shutdown.is_set():
-            item = await self._next_item()
-            if item is None:
+            batch = await self._next_batch()
+            if not batch:
                 break
             self.stats.current_interval = self.pacer.effective_interval
             await self.pacer.wait()
             if self.shutdown.is_set():
-                self._enqueue(item, reserved=True)
+                for item in batch:
+                    self._enqueue(item, reserved=True)
                 break
-            await self._submit_one(item)
+            await self._submit_batch(batch)
         self.stats.submitter_finished = True
 
     async def _next_item(self) -> UrlSubmission | None:
@@ -558,37 +572,62 @@ class _Runner:
                 await self.interruptible_sleep(0.1)
         return None
 
-    async def _submit_one(self, item: UrlSubmission) -> None:
-        item.queued = False
-        attempted = item.snapshot()
+    async def _next_batch(self) -> list[UrlSubmission]:
+        """Block for one queued URL, then greedily fill up to the batch size."""
+        first = await self._next_item()
+        if first is None:
+            return []
+        batch = [first]
+        while len(batch) < self.config.submit.batch_size:
+            try:
+                batch.append(self.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return batch
+
+    async def _submit_batch(self, batch: list[UrlSubmission]) -> None:
+        attempts: list[UrlSubmission] = []
+        for item in batch:
+            item.queued = False
+            attempts.append(item.snapshot())
+        requests = [attempted.to_request(self.hostname) for attempted in attempts]
         try:
-            outcome = await self.client.ingest_url(attempted.to_request(self.hostname))
+            outcomes = await self.client.ingest_batch(requests)
         except (httpx2.TransportError, ServerError) as exc:
-            self._handle_submit_error(item, exc)
+            self.pacer.on_failure()
+            for item in batch:
+                self._handle_submit_error(item, exc)
             return
-        except ValidationRejectedError as exc:
-            self.pacer.on_success()
-            self.stats.submitted += 1
+        self.pacer.on_success()
+        by_index = {result.index: result.outcome for result in outcomes}
+        for index, (item, attempted) in enumerate(zip(batch, attempts, strict=True)):
+            outcome = by_index.get(index)
+            if outcome is None:
+                # A well-formed batch always echoes every item; retry any it drops.
+                self._handle_submit_error(item, _MissingBatchResultError(index))
+                continue
+            await self._apply_item_outcome(item, attempted, outcome)
+
+    async def _apply_item_outcome(
+        self, item: UrlSubmission, attempted: UrlSubmission, outcome: BatchOutcome
+    ) -> None:
+        self.stats.submitted += 1
+        if profile_stats := self.stats.per_profile.get(attempted.primary.profile_key):
+            profile_stats.submitted += 1
+        if isinstance(outcome, Rejected):
             self.stats.rejected += 1
-            if profile_stats := self.stats.per_profile.get(
-                attempted.primary.profile_key
-            ):
-                profile_stats.submitted += 1
+            message = f"server rejected the request: {outcome.detail}"
             display_url = _log_url(item.url)
-            self.stats.add_event(f"rejected {_short(display_url)}: {exc}")
-            logger.info("rejected (422) {}: {}", display_url, exc)
+            self.stats.add_event(f"rejected {_short(display_url)}: {message}")
+            logger.info("rejected (422) {}: {}", display_url, message)
             await self.state.record_submission(
                 url=attempted.url,
                 outcome="rejected",
                 run_id=self.run_id,
                 last_visit_at=attempted.last_visit_at,
-                last_error=str(exc),
+                last_error=message,
             )
             return
-        self.pacer.on_success()
-        self.stats.submitted += 1
-        if profile_stats := self.stats.per_profile.get(attempted.primary.profile_key):
-            profile_stats.submitted += 1
         await self._record_outcome(attempted, outcome)
         if isinstance(outcome, Accepted | Revisit):
             item.last_submitted_visit_at = attempted.last_visit_at
@@ -652,7 +691,6 @@ class _Runner:
                 )
 
     def _handle_submit_error(self, item: UrlSubmission, exc: Exception) -> None:
-        self.pacer.on_failure()
         item.attempts += 1
         if item.attempts >= self.config.pacing.max_attempts:
             self.stats.errors += 1
@@ -697,28 +735,32 @@ class _Runner:
             await self.interruptible_sleep(self.config.poller.interval)
 
     async def _poll_batch(self, page_ids: list[str]) -> None:
-        for page_id in page_ids:
-            if self.shutdown.is_set():
-                return
-            try:
-                status = await self.client.page_status(page_id)
-            except (httpx2.HTTPError, ServerError):
+        if not page_ids:
+            return
+        try:
+            results = await self.client.page_status_batch(page_ids)
+        except (httpx2.HTTPError, ServerError):
+            return
+        for result in results:
+            if not isinstance(result, PageStatusBatchFoundResult):
                 continue
             await self.state.update_page_status(
-                page_id=page_id, status=status.status, last_error=status.last_error
+                page_id=result.page_id,
+                status=result.status,
+                last_error=result.last_error,
             )
-            match status.status:
+            match result.status:
                 case "indexed":
                     self.stats.indexed += 1
                 case "dead":
                     self.stats.dead += 1
                     self.stats.add_event(
-                        f"dead: {page_id} ({status.last_error or 'unknown error'})"
+                        f"dead: {result.page_id} "
+                        f"({result.last_error or 'unknown error'})"
                     )
-                    logger.info("dead: {} ({})", page_id, status.last_error)
+                    logger.info("dead: {} ({})", result.page_id, result.last_error)
                 case _:
                     pass
-            await asyncio.sleep(0.1)
 
     async def backlog_watcher(self) -> None:
         """Feed the server's pending-job depth into the pacer."""
@@ -838,7 +880,18 @@ async def _dry_run(
             shutdown=asyncio.Event(),
             emit=collect,
         )
-    print_dry_run_report(console, stats, collected)
+    pages = [
+        submission.snapshot().to_request(socket.gethostname())
+        for submission in collected
+    ]
+    with console.status("estimating storage and cost..."):
+        estimate = await estimate_pages(
+            pages,
+            config=config,
+            state=state,
+            batch_size=config.submit.batch_size,
+        )
+    print_dry_run_report(console, stats, collected, estimate=estimate)
 
 
 async def run_import(
@@ -880,6 +933,10 @@ async def run_import(
             ) as client:
                 with console.status("waiting for the server to be ready..."):
                     await client.wait_ready()
+                if not client.supports_batch_ingest:
+                    raise RequiresBatchApiError("batch_ingest")
+                if not client.supports_batch_status:
+                    raise RequiresBatchApiError("batch_status")
                 runner = _Runner(
                     client=client,
                     state=state,

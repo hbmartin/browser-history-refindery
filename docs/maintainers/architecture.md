@@ -1,9 +1,9 @@
 # Architecture and backend contract
 
 `browser-history-refindery` is a Typer CLI with synchronous browser readers, an
-asynchronous local state store and HTTP client, and a materialized-plan import
-pipeline. Internal Python modules are implementation details rather than a
-stable library API.
+asynchronous local state store and HTTP client, and a streaming import pipeline.
+Internal Python modules are implementation details rather than a stable library
+API.
 
 ## Component map
 
@@ -11,10 +11,14 @@ stable library API.
 flowchart LR
     CLI["Typer CLI"] --> Discovery["Profile discovery"]
     Discovery --> Readers["Snapshot + browser readers"]
-    Readers --> Plan["Merge, deduplicate, filter, sort"]
+    Readers --> Plan["Merge, deduplicate, filter"]
     State["Local SQLite state"] <--> Plan
-    Plan --> Submitter["Adaptive submitter"]
-    Submitter --> API["Refindery API"]
+    Plan --> Estimator["Dry-run estimator"]
+    State <--> Estimator
+    Estimator --> API["Refindery API"]
+    Plan --> Queue["In-memory queue"]
+    Queue --> Submitter["Adaptive submitter"]
+    Submitter --> API
     Poller["Status poller"] <--> API
     Backlog["Backlog watcher"] <--> API
     State <--> Submitter
@@ -28,31 +32,40 @@ The package entry point is
 `browser_history_refindery.cli:app`. Command functions perform synchronous CLI
 setup and enter the async pipeline with `asyncio.run`.
 
-## Read and plan phase
+## Streaming read and plan phase
 
 Browser readers use the standard-library SQLite client and run through
 `asyncio.to_thread`. Each reader copies the main database and WAL/SHM sidecars
 to a temporary directory, opens the copy read-only, and returns aggregated
 `VisitRecord` values.
 
-`pipeline.run_import` fully materializes the plan before network submission:
+For an unbounded import, `pipeline.run_import` overlaps planning and delivery:
 
-1. read each profile from its watermark;
-2. merge identical URLs across profiles;
-3. load submission visit timestamps and permanent rejections from state;
-4. deduplicate and apply `ExclusionEngine`;
-5. persist local skip reasons;
-6. sort newest-first and apply `--limit`; and
-7. calculate which profile watermarks remain safe to advance.
+1. load submission visit timestamps and permanent rejections from state;
+2. read one profile from its watermark;
+3. merge its records into the shared URL map;
+4. deduplicate, apply `ExclusionEngine`, and persist local skip reasons;
+5. enqueue that profile's eligible URLs newest-first; and
+6. repeat while the submitter drains the queue.
 
-Materialization makes totals and ordering deterministic and lets `--dry-run`
-render the exact plan. Its memory use grows with the number of distinct URLs in
-the read window.
+The merge map remains live while profiles are read. A queued URL therefore gains
+later-profile metadata until its HTTP attempt takes an immutable snapshot. A
+URL already sent keeps its earlier snapshot; when revisit resubmission is
+enabled, a later, newer sighting can enqueue it again.
+
+`--limit` fully materializes all profiles, globally sorts candidates
+newest-first, and emits only the selected prefix. Profiles represented by
+dropped candidates do not offer a watermark. `--dry-run` also reads all
+profiles without starting the delivery tasks, then makes a one-shot readiness
+probe and optional batch-estimate requests. Estimation failures use the cached
+per-server profile for unresolved pages and never change submission or
+watermark state.
 
 ## Concurrent delivery phase
 
-An `asyncio.TaskGroup` runs three long-lived tasks:
+An `asyncio.TaskGroup` runs four long-lived tasks:
 
+- the producer streams profile work into the queue;
 - the submitter drains an in-memory queue through `AdaptivePacer`;
 - the status poller advances recorded page IDs toward `indexed` or `dead`; and
 - the backlog watcher feeds pending-job depth into the pacer.
@@ -80,7 +93,7 @@ graceful shutdown; the second cancels pipeline tasks.
 
 ## Local state schema
 
-Schema version 3 has four tables:
+Schema version 4 has five tables:
 
 | Table | Purpose |
 | --- | --- |
@@ -88,6 +101,7 @@ Schema version 3 has four tables:
 | `submissions` | One row per URL, page ID, outcome, latest server status, errors, and represented visit time. |
 | `skips` | One row per locally excluded URL and its first matching rule. |
 | `profile_watermarks` | Latest cleanly processed visit per path-aware browser profile. |
+| `estimation_profiles` | Latest validated fallback estimate profile per normalized Refindery base URL. |
 
 SQLite WAL mode and foreign keys are enabled. Migrations add missing columns
 from older supported schemas. A future schema version raises
@@ -95,21 +109,28 @@ from older supported schemas. A future schema version raises
 
 ## Refindery HTTP contract
 
-Every request uses `Authorization: Bearer TOKEN` and the configured base URL.
+Every `/v1` request uses `Authorization: Bearer TOKEN` and the configured base
+URL; `GET /readyz` is probed without requiring authentication. Real imports
+require **Refindery >= 0.2.0** and fail fast unless readiness advertises batch
+ingest and status. Live dry-run estimates additionally require
+`capabilities.batch_estimate`; missing support degrades to cached or unavailable
+estimates without failing the command.
 
 | Method and path | Purpose | Response expected by the importer |
 | --- | --- | --- |
-| `GET /readyz` | Startup readiness gate | `200` when ready. |
-| `POST /v1/pages` | Submit URL-only ingest metadata | `202` accepted, `200` revisit, `403` blacklisted, `401` auth failure, or `422` validation rejection. |
-| `GET /v1/pages/{page_id}/status` | Poll page lifecycle | JSON status in `queued`, `indexing`, `indexed`, `failed`, or `dead`. |
-| `GET /v1/jobs?status_filter=pending&limit=N` | Estimate backlog | A list, or an object containing a list, whose rows are counted up to `N`. |
+| `GET /readyz` | Startup readiness gate + capability probe | `200` with `capabilities.batch_ingest` and `capabilities.batch_status` for imports; `capabilities.batch_estimate` enables live dry-run estimates. |
+| `POST /v1/pages/batch` | Submit up to 100 URL-only ingest items | `200` with an ordered `results` array; each item carries an `outcome` of `accepted` (202-equivalent), `revisit` (200), `blacklisted` (403), or `rejected` (422), plus its input `index`. `401` fails the whole batch. |
+| `POST /v1/pages/estimate/batch` | Estimate up to 100 URL-only ingest items without persistence or paid-provider calls | `200` with a validated fallback `profile` and exactly one indexed result per input: `estimated`, `revisit`, `blacklisted`, `rejected`, or `unavailable`. |
+| `POST /v1/pages/status/batch` | Poll up to 500 page lifecycles | `200` with a `results` array; each entry is `found=true` with `status` in `queued`/`indexing`/`indexed`/`failed`/`dead`, or `found=false` for an unknown id. |
+| `GET /v1/jobs?status=pending&limit=N` | Estimate backlog | A list, or an object containing a list, whose rows are counted up to `N`. |
 | `POST /v1/forget` | Purge URL/domain and create blacklist rule | Purge count, rule ID, pattern, kind, and vector deletion count. |
 | `GET /v1/blacklist` | List server rules | An `entries` array. |
 | `DELETE /v1/blacklist/{id}` | Remove one rule | Any successful HTTP response. |
 
 ### Ingest request
 
-`POST /v1/pages` sends no page body. The validated JSON shape is:
+`POST /v1/pages/batch` and `POST /v1/pages/estimate/batch` send no page bodies.
+Both use a validated `{"pages": [...]}` envelope whose items each look like:
 
 ```json
 {
@@ -130,7 +151,16 @@ Every request uses `Authorization: Bearer TOKEN` and the configured base URL.
 
 When several profiles contain the URL, `metadata.sources` contains the browser,
 profile, visit count, and first/last timestamps for each source. Null fields are
-omitted.
+omitted. Batch size is `[submit].batch_size` (1–100); status polling reads up to
+`[poller].batch_size` (1–500) ids per request.
+
+Estimate responses represent storage in integer bytes and USD costs as decimal
+strings. A result with an unpriced paid component has a null total plus an
+`unpriced_components` list; the importer never treats it as zero. The fallback
+profile includes a configuration fingerprint, generation timestamp, per-page
+storage/cost values, component breakdown, and the same unpriced-component
+semantics. Missing, duplicate, or out-of-range result indices invalidate the
+whole estimate batch.
 
 ## Compatibility policy
 

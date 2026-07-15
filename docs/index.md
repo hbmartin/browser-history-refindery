@@ -33,6 +33,8 @@ page bodies.
   full scans, deduplication, interruption, and resumability.
 - [Privacy and exclusions](guide/privacy.md) documents what leaves the machine
   and how every local and server-side filter behaves.
+- [Frequently asked questions](reference/faq.md) covers safe interruption,
+  crash recovery, deduplication, local state, and common operating choices.
 - [CLI reference](reference/cli.md) and
   [configuration reference](reference/configuration.md) list every supported
   command, option, setting, and default.

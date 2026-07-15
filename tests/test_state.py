@@ -3,9 +3,11 @@
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
+from browser_history_refindery.api_models import EstimateFallbackProfile
 from browser_history_refindery.browsers.base import BrowserFamily, BrowserProfile
 from browser_history_refindery.filters import SkipKind, SkipReason
 from browser_history_refindery.state import StateSchemaTooNewError, StateStore
@@ -135,7 +137,60 @@ async def test_v1_state_migrates_submission_visit_times(tmp_path):
         }
         schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     assert "rejected" in run_columns
-    assert schema_version == 3
+    assert schema_version == 4
+
+
+def _estimate_profile(*, fingerprint: str = "config-a") -> EstimateFallbackProfile:
+    return EstimateFallbackProfile(
+        config_fingerprint=fingerprint,
+        generated_at="2026-07-14T12:00:00Z",
+        storage_bytes_per_page=2_048,
+        cost_usd_per_page=Decimal("0.0015"),
+        cost_breakdown_usd_per_page={"embedding": Decimal("0.0015")},
+    )
+
+
+async def test_estimation_profile_cache_is_keyed_and_replaced(store) -> None:
+    first = _estimate_profile()
+    await store.set_estimation_profile(
+        server_base_url="https://one.example/", profile=first
+    )
+    assert (
+        await store.get_estimation_profile(server_base_url="https://one.example")
+        == first
+    )
+    assert (
+        await store.get_estimation_profile(server_base_url="https://two.example")
+        is None
+    )
+
+    replacement = _estimate_profile(fingerprint="config-b")
+    await store.set_estimation_profile(
+        server_base_url="https://one.example", profile=replacement
+    )
+    assert (
+        await store.get_estimation_profile(server_base_url="https://one.example")
+        == replacement
+    )
+
+
+async def test_invalid_cached_estimation_profile_is_ignored(tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    async with StateStore(db_path) as state:
+        await state.set_estimation_profile(
+            server_base_url="https://one.example", profile=_estimate_profile()
+        )
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE estimation_profiles SET profile_json = ?",
+            ('{"storage_bytes_per_page": -1}',),
+        )
+        conn.commit()
+    async with StateStore(db_path) as state:
+        assert (
+            await state.get_estimation_profile(server_base_url="https://one.example")
+            is None
+        )
 
 
 async def test_open_refuses_newer_schema(tmp_path):
