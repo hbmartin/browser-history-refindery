@@ -21,6 +21,7 @@ nav = [
         { "CLI" = "reference/cli.md" },
         { "Configuration" = "reference/configuration.md" },
         { "Browser compatibility" = "reference/browsers.md" },
+        { "Frequently asked questions" = "reference/faq.md" },
         { "Troubleshooting" = "reference/troubleshooting.md" },
     ] },
     { "Maintainers" = [

@@ -1,9 +1,11 @@
 """Smoke tests for the detailed dashboard and end-of-run reports."""
 
 import io
+from decimal import Decimal
 
 from rich.console import Console
 
+from browser_history_refindery.estimation import DryRunEstimate
 from browser_history_refindery.stats import ProfileStats, RunStats
 from browser_history_refindery.ui import (
     build_progress,
@@ -86,7 +88,27 @@ def test_dry_run_report_lists_urls():
             self.url = url
 
     submissions = [_Sub(f"https://example.com/{index}") for index in range(12)]
-    print_dry_run_report(console, _populated_stats(), submissions)
+    estimate = DryRunEstimate(
+        total_pages=12,
+        domains=(("example.com", 10), ("docs.example.com", 2)),
+        storage_bytes=1_572_864,
+        cost_usd=Decimal("0.0125"),
+        cost_breakdown_usd={"embedding": Decimal("0.0125")},
+        live_pages=9,
+        fallback_pages=1,
+        zero_impact_pages=2,
+        unavailable_pages=0,
+        unpriced_components=(),
+        fallback_profile_generated_at=None,
+        notes=("used a cached fallback profile for 1 page(s)",),
+    )
+    print_dry_run_report(console, _populated_stats(), submissions, estimate=estimate)
     output = buffer.getvalue()
     assert "Dry run" in output
     assert "and 2 more" in output  # 12 submissions, first 10 shown
+    assert "eligible pages" in output
+    assert "example.com" in output
+    assert "docs.example.com" in output
+    assert "1.5 MiB" in output
+    assert "$0.0125 USD" in output
+    assert "embedding" in output

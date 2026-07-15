@@ -14,7 +14,14 @@ import pytest
 from pytest_httpx2 import HTTPXMock
 from rich.console import Console
 
-from browser_history_refindery.api_client import Accepted, AuthError, Revisit
+from browser_history_refindery.api_client import (
+    Accepted,
+    AuthError,
+    BatchItemOutcome,
+    RequiresBatchApiError,
+    Revisit,
+    ServerError,
+)
 from browser_history_refindery.api_models import IngestPageRequest
 from browser_history_refindery.browsers import BrowserFamily
 from browser_history_refindery.browsers.base import VisitRecord, to_chromium_us
@@ -93,19 +100,74 @@ def quiet_console() -> Console:
 
 
 def _ingest_response(request: httpx2.Request) -> httpx2.Response:
-    body = json.loads(request.content)
-    if body["url"] == "https://blocked.example/":
-        return httpx2.Response(
-            403, json={"error": "blacklisted", "pattern": "blocked.example"}
+    """Respond to POST /v1/pages/batch with one outcome per input page."""
+    pages = json.loads(request.content)["pages"]
+    results = []
+    for index, page in enumerate(pages):
+        if page["url"] == "https://blocked.example/":
+            results.append(
+                {"outcome": "blacklisted", "index": index, "pattern": "blocked.example"}
+            )
+            continue
+        page_id = f"pg_{abs(hash(page['url'])) % 10_000}"
+        results.append(
+            {
+                "outcome": "accepted",
+                "index": index,
+                "page_id": page_id,
+                "status": "queued",
+            }
         )
-    page_id = f"pg_{abs(hash(body['url'])) % 10_000}"
-    return httpx2.Response(202, json={"page_id": page_id, "status": "queued"})
+    return httpx2.Response(200, json={"results": results})
 
 
 def _status_response(request: httpx2.Request) -> httpx2.Response:
-    page_id = request.url.path.rsplit("/", maxsplit=2)[-2]
+    """Respond to POST /v1/pages/status/batch, reporting every id indexed."""
+    page_ids = json.loads(request.content)["page_ids"]
     return httpx2.Response(
-        200, json={"page_id": page_id, "status": "indexed", "last_error": None}
+        200,
+        json={
+            "results": [
+                {
+                    "found": True,
+                    "page_id": page_id,
+                    "status": "indexed",
+                    "last_error": None,
+                }
+                for page_id in page_ids
+            ]
+        },
+    )
+
+
+def _estimate_response(request: httpx2.Request) -> httpx2.Response:
+    """Return deterministic per-page estimates without ingesting anything."""
+    pages = json.loads(request.content)["pages"]
+    return httpx2.Response(
+        200,
+        json={
+            "profile": {
+                "config_fingerprint": "cfg-test",
+                "generated_at": "2026-07-14T12:00:00Z",
+                "storage_bytes_per_page": 2_048,
+                "cost_usd_per_page": "0.001",
+                "cost_breakdown_usd_per_page": {"embedding": "0.001"},
+                "unpriced_components": [],
+            },
+            "results": [
+                {
+                    "outcome": "estimated",
+                    "index": index,
+                    "token_count": 100,
+                    "chunk_count": 1,
+                    "estimated_storage_bytes": 2_048,
+                    "estimated_cost_usd": "0.001",
+                    "cost_breakdown_usd": {"embedding": "0.001"},
+                    "unpriced_components": [],
+                }
+                for index, _page in enumerate(pages)
+            ],
+        },
     )
 
 
@@ -119,7 +181,14 @@ def mock_preflight(
         method="GET",
         url=endpoint("/readyz"),
         status_code=200,
-        json={"status": "ready"},
+        json={
+            "status": "ready",
+            "capabilities": {
+                "batch_ingest": True,
+                "batch_status": True,
+                "batch_estimate": True,
+            },
+        },
         is_optional=ready_optional,
         is_reusable=True,
     )
@@ -133,6 +202,16 @@ def mock_preflight(
     )
 
 
+def mock_status(httpx2_mock: HTTPXMock, *, is_optional: bool = False) -> None:
+    httpx2_mock.add_callback(
+        _status_response,
+        method="POST",
+        url=endpoint("/v1/pages/status/batch"),
+        is_optional=is_optional,
+        is_reusable=True,
+    )
+
+
 def mock_api(httpx2_mock: HTTPXMock, *, is_optional: bool = False) -> None:
     """Wire all import API routes."""
     mock_preflight(
@@ -140,24 +219,39 @@ def mock_api(httpx2_mock: HTTPXMock, *, is_optional: bool = False) -> None:
         ready_optional=is_optional,
         jobs_optional=is_optional,
     )
+    mock_status(httpx2_mock, is_optional=is_optional)
     httpx2_mock.add_callback(
-        _status_response,
-        method="GET",
-        url=re.compile(rf"{re.escape(BASE)}/v1/pages/[^/]+/status"),
+        _ingest_response,
+        method="POST",
+        url=endpoint("/v1/pages/batch"),
         is_optional=is_optional,
         is_reusable=True,
     )
     httpx2_mock.add_callback(
-        _ingest_response,
+        _estimate_response,
         method="POST",
-        url=endpoint("/v1/pages"),
-        is_optional=is_optional,
+        url=endpoint("/v1/pages/estimate/batch"),
+        is_optional=True,
         is_reusable=True,
     )
 
 
 def ingest_requests(httpx2_mock: HTTPXMock) -> list[httpx2.Request]:
-    return httpx2_mock.get_requests(method="POST", url=endpoint("/v1/pages"))
+    return httpx2_mock.get_requests(method="POST", url=endpoint("/v1/pages/batch"))
+
+
+def estimate_requests(httpx2_mock: HTTPXMock) -> list[httpx2.Request]:
+    return httpx2_mock.get_requests(
+        method="POST", url=endpoint("/v1/pages/estimate/batch")
+    )
+
+
+def ingest_bodies(httpx2_mock: HTTPXMock) -> list[dict]:
+    """Flatten every submitted page across all batch requests."""
+    bodies: list[dict] = []
+    for request in ingest_requests(httpx2_mock):
+        bodies.extend(json.loads(request.content)["pages"])
+    return bodies
 
 
 def test_runtime_only_exception_group_unwraps_first_error():
@@ -346,7 +440,7 @@ async def test_full_import_run(httpx2_mock: HTTPXMock, tmp_path: Path) -> None:
     # The shared URL is submitted exactly once. Under streaming the fully-merged
     # cross-profile shape is timing-dependent (see the dedicated merge test that
     # exercises _stream_profiles directly), so we only assert it was sent once.
-    posts = [json.loads(request.content) for request in ingest_requests(httpx2_mock)]
+    posts = ingest_bodies(httpx2_mock)
     assert sum(body["url"] == SHARED_URL for body in posts) == 1
 
     async with StateStore(config.state.db_path) as state:
@@ -535,11 +629,13 @@ async def test_submit_persists_the_attempted_snapshot(tmp_path: Path) -> None:
     attempted_requests: list[IngestPageRequest] = []
 
     class MutatingClient:
-        async def ingest_url(self, request: IngestPageRequest) -> Accepted:
-            attempted_requests.append(request)
+        async def ingest_batch(
+            self, requests: list[IngestPageRequest]
+        ) -> list[BatchItemOutcome]:
+            attempted_requests.extend(requests)
             _merge_record(merged, later)
             await asyncio.sleep(0)
-            return Accepted(page_id="pg_snapshot")
+            return [BatchItemOutcome(0, Accepted(page_id="pg_snapshot"))]
 
     async with StateStore(config.state.db_path) as state:
         run_id = await state.begin_run()
@@ -554,7 +650,7 @@ async def test_submit_persists_the_attempted_snapshot(tmp_path: Path) -> None:
             ignore_watermarks=False,
             limit=None,
         )
-        await runner._submit_one(item)  # noqa: SLF001 - targeted runner regression
+        await runner._submit_batch([item])  # noqa: SLF001 - targeted runner regression
         observed = await state.load_submission_visit_times()
 
     assert attempted_requests[0].fetched_at == T0
@@ -641,12 +737,21 @@ async def test_submit_requeues_on_revisit_when_newer_visit_appears(
     item = merged[url]
 
     class RevisitClient:
-        async def ingest_url(self, _request: IngestPageRequest) -> Revisit:
+        async def ingest_batch(
+            self, _requests: list[IngestPageRequest]
+        ) -> list[BatchItemOutcome]:
             _merge_record(merged, later)
             await asyncio.sleep(0)
-            return Revisit(
-                page_id="pg_revisit", status="indexed", content_hash_differs=False
-            )
+            return [
+                BatchItemOutcome(
+                    0,
+                    Revisit(
+                        page_id="pg_revisit",
+                        status="indexed",
+                        content_hash_differs=False,
+                    ),
+                )
+            ]
 
     async with StateStore(config.state.db_path) as state:
         run_id = await state.begin_run()
@@ -661,7 +766,7 @@ async def test_submit_requeues_on_revisit_when_newer_visit_appears(
             ignore_watermarks=False,
             limit=None,
         )
-        await runner._submit_one(item)  # noqa: SLF001 - targeted runner regression
+        await runner._submit_batch([item])  # noqa: SLF001 - targeted runner regression
         observed = await state.load_submission_visit_times()
 
     assert runner.stats.revisits == 1
@@ -672,13 +777,112 @@ async def test_submit_requeues_on_revisit_when_newer_visit_appears(
     assert runner.stats.total_to_submit == 1
 
 
+def _submission_for(url: str, profile) -> UrlSubmission:
+    merged: dict[str, UrlSubmission] = {}
+    _merge_record(
+        merged,
+        VisitRecord(
+            url=url,
+            title="T",
+            visit_count=1,
+            first_visit_at=T0,
+            last_visit_at=T0,
+            profile=profile,
+        ),
+    )
+    return merged[url]
+
+
+def _idle_runner(config: AppConfig, client, state) -> _Runner:
+    return _Runner(
+        client=cast("Any", client),
+        state=cast("Any", state),
+        stats=RunStats(),
+        config=config,
+        run_id=1,
+        profiles=[],
+        engine=ExclusionEngine(config.exclusions),
+        ignore_watermarks=False,
+        limit=None,
+    )
+
+
+async def test_next_batch_fills_up_to_batch_size(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.submit.batch_size = 3
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    runner = _idle_runner(config, object(), object())
+    items = [_submission_for(f"https://e{i}.example/", profile) for i in range(5)]
+    for item in items:
+        assert runner._enqueue(item) is True  # noqa: SLF001 - queue-state regression
+
+    first = await runner._next_batch()  # noqa: SLF001 - targeted batching regression
+    runner.producer_done.set()
+    second = await runner._next_batch()  # noqa: SLF001 - targeted batching regression
+    third = await runner._next_batch()  # noqa: SLF001 - targeted batching regression
+
+    assert first == items[:3]  # a full batch is drained greedily
+    assert second == items[3:]  # the remainder flushes as a partial batch
+    assert third == []  # producer done and queue empty -> stop
+
+
+async def test_batch_transport_error_requeues_every_item(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    profile = profile_for(tmp_path / "History", BrowserFamily.CHROMIUM)
+    items = [_submission_for(f"https://e{i}.example/", profile) for i in range(2)]
+
+    class FailingClient:
+        async def ingest_batch(
+            self, _requests: list[IngestPageRequest]
+        ) -> list[BatchItemOutcome]:
+            raise ServerError(503)
+
+    async with StateStore(config.state.db_path) as state:
+        await state.begin_run()
+        runner = _idle_runner(config, FailingClient(), state)
+        for item in items:
+            runner._enqueue(item)  # noqa: SLF001 - queue-state regression
+        batch = await runner._next_batch()  # noqa: SLF001 - targeted batching regression
+        await runner._submit_batch(batch)  # noqa: SLF001 - targeted batching regression
+
+    assert runner.stats.retries == 2
+    assert runner.stats.errors == 0
+    assert all(item.attempts == 1 for item in items)
+    requeued = {id(runner.queue.get_nowait()) for _ in range(len(items))}
+    assert requeued == {id(item) for item in items}
+    assert all(item.queued for item in items)
+
+
+async def test_run_requires_batch_capability(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    httpx2_mock.add_response(
+        method="GET",
+        url=endpoint("/readyz"),
+        status_code=200,
+        json={"status": "ready"},  # a pre-0.2.0 server advertises no capabilities
+        is_reusable=True,
+    )
+    config = make_config(tmp_path)
+    db = tmp_path / "History"
+    make_chromium_db(db, [("https://gate.example/", "Gate", [T0], 0)])
+
+    with pytest.raises(RequiresBatchApiError):
+        await run_import(
+            config=config,
+            profiles=[profile_for(db, BrowserFamily.CHROMIUM)],
+            console=quiet_console(),
+        )
+    assert not ingest_requests(httpx2_mock)
+
+
 async def test_task_group_unwraps_auth_error(
     httpx2_mock: HTTPXMock, tmp_path: Path
 ) -> None:
     mock_preflight(httpx2_mock, jobs_optional=True)
     httpx2_mock.add_response(
         method="POST",
-        url=endpoint("/v1/pages"),
+        url=endpoint("/v1/pages/batch"),
         status_code=401,
         json={"detail": "missing or invalid bearer token"},
     )
@@ -699,11 +903,17 @@ async def test_validation_rejection_is_terminal_and_not_retried(
     httpx2_mock: HTTPXMock, tmp_path: Path
 ) -> None:
     mock_preflight(httpx2_mock, jobs_optional=True)
+    mock_status(httpx2_mock, is_optional=True)
     httpx2_mock.add_response(
         method="POST",
-        url=endpoint("/v1/pages"),
-        status_code=422,
-        json={"detail": "URL is not ingestible"},
+        url=endpoint("/v1/pages/batch"),
+        status_code=200,
+        json={
+            "results": [
+                {"outcome": "rejected", "index": 0, "detail": "URL is not ingestible"}
+            ]
+        },
+        is_reusable=True,
     )
     config = make_config(tmp_path)
     db = tmp_path / "History"
@@ -760,21 +970,15 @@ async def test_transient_server_error_is_retried_then_succeeds(
 ) -> None:
     mock_preflight(httpx2_mock, jobs_optional=True)
     httpx2_mock.add_response(
-        method="POST", url=endpoint("/v1/pages"), status_code=503, json={}
+        method="POST", url=endpoint("/v1/pages/batch"), status_code=503, json={}
     )  # single-use: the first attempt fails
     httpx2_mock.add_callback(
         _ingest_response,
         method="POST",
-        url=endpoint("/v1/pages"),
+        url=endpoint("/v1/pages/batch"),
         is_reusable=True,
     )
-    httpx2_mock.add_callback(
-        _status_response,
-        method="GET",
-        url=re.compile(rf"{re.escape(BASE)}/v1/pages/[^/]+/status"),
-        is_optional=True,
-        is_reusable=True,
-    )
+    mock_status(httpx2_mock, is_optional=True)
     config = make_config(tmp_path)
     db = tmp_path / "History"
     make_chromium_db(db, [("https://flaky.example/", "Flaky", [T0], 0)])
@@ -797,7 +1001,7 @@ async def test_repeated_errors_give_up_and_hold_watermark(
     mock_preflight(httpx2_mock, jobs_optional=True)
     httpx2_mock.add_response(
         method="POST",
-        url=endpoint("/v1/pages"),
+        url=endpoint("/v1/pages/batch"),
         status_code=503,
         json={},
         is_reusable=True,  # every attempt fails
@@ -823,14 +1027,42 @@ async def test_dry_run_submits_nothing(httpx2_mock: HTTPXMock, tmp_path: Path) -
     mock_api(httpx2_mock, is_optional=True)
     config = make_config(tmp_path)
     profiles = make_profiles(tmp_path)
+    console = quiet_console()
 
     stats = await run_import(
-        config=config, profiles=profiles, console=quiet_console(), dry_run=True
+        config=config, profiles=profiles, console=console, dry_run=True
     )
     assert stats.total_to_submit == 3
     assert stats.urls_read_total == 5  # 3 chrome rows + 2 safari rows
     assert stats.unique_urls == 4  # SHARED_URL merges across the two browsers
     assert not ingest_requests(httpx2_mock)
+    assert len(estimate_requests(httpx2_mock)) == 1
+    output = cast("io.StringIO", console.file).getvalue()
+    assert "eligible pages" in output
+    assert "6.0 KiB" in output
+    assert "$0.003 USD" in output
+    async with StateStore(config.state.db_path) as state:
+        assert await state.load_submission_visit_times() == {}
+        for profile in profiles:
+            assert await state.get_watermark(profile) is None
+
+
+async def test_dry_run_estimates_only_pages_kept_by_limit(
+    httpx2_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    mock_api(httpx2_mock, is_optional=True)
+    config = make_config(tmp_path)
+    stats = await run_import(
+        config=config,
+        profiles=make_profiles(tmp_path),
+        console=quiet_console(),
+        dry_run=True,
+        limit=1,
+    )
+    assert stats.total_to_submit == 1
+    requests = estimate_requests(httpx2_mock)
+    assert len(requests) == 1
+    assert len(json.loads(requests[0].content)["pages"]) == 1
 
 
 async def test_stream_profiles_merges_across_profiles(tmp_path: Path) -> None:

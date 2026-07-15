@@ -1,6 +1,7 @@
 """Async HTTP client for the Refindery ingest API."""
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -10,13 +11,22 @@ from typing import Any, Self
 import httpx2
 
 from browser_history_refindery.api_models import (
-    BlacklistedResponse,
     BlacklistResponse,
+    EstimateBatchRequest,
+    EstimateBatchResponse,
     ForgetResponse,
-    IngestAcceptedResponse,
+    IngestBatchAcceptedResult,
+    IngestBatchBlacklistedResult,
+    IngestBatchRejectedResult,
+    IngestBatchRequest,
+    IngestBatchResponse,
+    IngestBatchResult,
+    IngestBatchRevisitResult,
     IngestPageRequest,
-    IngestRevisitResponse,
-    PageStatusResponse,
+    PageStatusBatchRequest,
+    PageStatusBatchResponse,
+    PageStatusBatchResult,
+    ReadyzResponse,
 )
 
 
@@ -43,7 +53,23 @@ class Blacklisted:
     pattern: str
 
 
+@dataclass(frozen=True, slots=True)
+class Rejected:
+    """422-equivalent: one batch item was independently invalid."""
+
+    detail: str
+
+
 IngestOutcome = Accepted | Revisit | Blacklisted
+BatchOutcome = Accepted | Revisit | Blacklisted | Rejected
+
+
+@dataclass(frozen=True, slots=True)
+class BatchItemOutcome:
+    """One page's outcome within a batch, tagged with its input index."""
+
+    index: int
+    outcome: BatchOutcome
 
 
 class AuthError(RuntimeError):
@@ -81,6 +107,26 @@ class ReadyTimeoutError(RuntimeError):
         )
 
 
+class RequiresBatchApiError(RuntimeError):
+    """The server does not advertise a batch capability this tool requires."""
+
+    def __init__(self, capability: str) -> None:
+        super().__init__(
+            f"the Refindery server does not advertise the {capability!r} capability: "
+            "this tool requires Refindery >= 0.2.0 (check that GET /readyz reports it)"
+        )
+
+
+class InvalidEstimateResponseError(RuntimeError):
+    """An estimate response did not map exactly once to every request item."""
+
+    def __init__(self, *, expected: int, indices: list[int]) -> None:
+        super().__init__(
+            f"estimate response indices must be exactly 0..{expected - 1}; "
+            f"got {indices}"
+        )
+
+
 class RefinderyClient:
     """Thin typed wrapper over the ingest and lifecycle endpoints."""
 
@@ -88,16 +134,35 @@ class RefinderyClient:
         self,
         *,
         base_url: str,
-        auth_token: str,
+        auth_token: str | None,
         request_timeout: float,
         ready_timeout: float,
     ) -> None:
         self._ready_timeout = ready_timeout
+        self._capabilities: frozenset[str] = frozenset()
+        headers = (
+            {} if auth_token is None else {"Authorization": f"Bearer {auth_token}"}
+        )
         self._http = httpx2.AsyncClient(
             base_url=base_url,
-            headers={"Authorization": f"Bearer {auth_token}"},
+            headers=headers,
             timeout=request_timeout,
         )
+
+    @property
+    def supports_batch_ingest(self) -> bool:
+        """Whether ``GET /readyz`` advertised the batch-ingest capability."""
+        return "batch_ingest" in self._capabilities
+
+    @property
+    def supports_batch_status(self) -> bool:
+        """Whether ``GET /readyz`` advertised the batch-status capability."""
+        return "batch_status" in self._capabilities
+
+    @property
+    def supports_batch_estimate(self) -> bool:
+        """Whether ``GET /readyz`` advertised live batch estimation."""
+        return "batch_estimate" in self._capabilities
 
     async def __aenter__(self) -> Self:
         return self
@@ -111,38 +176,37 @@ class RefinderyClient:
         await self._http.aclose()
 
     async def wait_ready(self, *, poll_interval: float = 1.0) -> None:
-        """Block until ``GET /readyz`` reports ready, or raise on timeout."""
+        """Block until ``GET /readyz`` reports ready, recording capabilities."""
         deadline = time.monotonic() + self._ready_timeout
         while True:
-            try:
-                response = await self._http.get("/readyz")
-                is_ready = response.status_code == HTTPStatus.OK
-            except httpx2.TransportError:
-                # A backend that has not bound its socket is not ready yet.
-                is_ready = False
-            if is_ready:
+            if await self.probe_ready():
                 return
             if time.monotonic() >= deadline:
                 raise ReadyTimeoutError(self._ready_timeout)
             await asyncio.sleep(poll_interval)
 
-    async def ingest_url(self, request: IngestPageRequest) -> IngestOutcome:
-        """POST one page and interpret the three expected outcomes."""
-        response = await self._http.post("/v1/pages", json=request.payload())
+    async def probe_ready(self) -> bool:
+        """Probe readiness once and record advertised capabilities."""
+        response = None
+        # A backend that has not bound its socket yet is simply not ready.
+        with contextlib.suppress(httpx2.TransportError):
+            response = await self._http.get("/readyz")
+        if response is None or response.status_code != HTTPStatus.OK:
+            self._capabilities = frozenset()
+            return False
+        self._capabilities = self._parse_capabilities(response)
+        return True
+
+    async def ingest_batch(
+        self, pages: list[IngestPageRequest]
+    ) -> list[BatchItemOutcome]:
+        """POST up to 100 pages and return each item's outcome by input index."""
+        request = IngestBatchRequest(pages=pages)
+        response = await self._http.post("/v1/pages/batch", json=request.payload())
         match response.status_code:
-            case HTTPStatus.ACCEPTED:
-                accepted = IngestAcceptedResponse.model_validate(response.json())
-                return Accepted(page_id=accepted.page_id)
             case HTTPStatus.OK:
-                revisit = IngestRevisitResponse.model_validate(response.json())
-                return Revisit(
-                    page_id=revisit.page_id,
-                    status=revisit.status,
-                    content_hash_differs=revisit.content_hash_differs,
-                )
-            case HTTPStatus.FORBIDDEN:
-                rejected = BlacklistedResponse.model_validate(response.json())
-                return Blacklisted(pattern=rejected.pattern)
+                parsed = IngestBatchResponse.model_validate(response.json())
+                return [self._batch_outcome(result) for result in parsed.results]
             case HTTPStatus.UNAUTHORIZED:
                 raise AuthError
             case HTTPStatus.UNPROCESSABLE_CONTENT:
@@ -150,21 +214,81 @@ class RefinderyClient:
             case status:
                 raise ServerError(status)
 
-    async def page_status(self, page_id: str) -> PageStatusResponse:
-        """Fetch the lifecycle status of one page."""
-        response = await self._http.get(f"/v1/pages/{page_id}/status")
+    async def estimate_batch(
+        self, pages: list[IngestPageRequest]
+    ) -> EstimateBatchResponse:
+        """Estimate up to 100 pages without submitting or indexing them."""
+        request = EstimateBatchRequest(pages=pages)
+        response = await self._http.post(
+            "/v1/pages/estimate/batch", json=request.payload()
+        )
+        match response.status_code:
+            case HTTPStatus.OK:
+                parsed = EstimateBatchResponse.model_validate(response.json())
+                indices = [result.index for result in parsed.results]
+                expected = len(pages)
+                if sorted(indices) != list(range(expected)):
+                    raise InvalidEstimateResponseError(
+                        expected=expected, indices=indices
+                    )
+                return parsed
+            case HTTPStatus.UNAUTHORIZED:
+                raise AuthError
+            case HTTPStatus.UNPROCESSABLE_CONTENT:
+                raise ValidationRejectedError(self._detail(response))
+            case status:
+                raise ServerError(status)
+
+    async def page_status_batch(
+        self, page_ids: list[str]
+    ) -> list[PageStatusBatchResult]:
+        """Fetch the lifecycle status of up to 500 pages in one request."""
+        request = PageStatusBatchRequest(page_ids=page_ids)
+        response = await self._http.post(
+            "/v1/pages/status/batch", json=request.model_dump()
+        )
         if response.status_code == HTTPStatus.UNAUTHORIZED:
             raise AuthError
         response.raise_for_status()
-        return PageStatusResponse.model_validate(response.json())
+        return PageStatusBatchResponse.model_validate(response.json()).results
 
     async def pending_job_count(self, *, limit: int) -> int:
         """Estimate the server's pending-job backlog (capped at ``limit``)."""
         response = await self._http.get(
-            "/v1/jobs", params={"status_filter": "pending", "limit": limit}
+            "/v1/jobs", params={"status": "pending", "limit": limit}
         )
         response.raise_for_status()
         return _count_rows(response.json())
+
+    @staticmethod
+    def _batch_outcome(result: IngestBatchResult) -> BatchItemOutcome:
+        match result:
+            case IngestBatchAcceptedResult(index=index, page_id=page_id):
+                return BatchItemOutcome(index, Accepted(page_id=page_id))
+            case IngestBatchRevisitResult(
+                index=index,
+                page_id=page_id,
+                status=status,
+                content_hash_differs=differs,
+            ):
+                return BatchItemOutcome(
+                    index,
+                    Revisit(
+                        page_id=page_id, status=status, content_hash_differs=differs
+                    ),
+                )
+            case IngestBatchBlacklistedResult(index=index, pattern=pattern):
+                return BatchItemOutcome(index, Blacklisted(pattern=pattern))
+            case IngestBatchRejectedResult(index=index, detail=detail):
+                return BatchItemOutcome(index, Rejected(detail=detail))
+
+    @staticmethod
+    def _parse_capabilities(response: httpx2.Response) -> frozenset[str]:
+        try:
+            parsed = ReadyzResponse.model_validate(response.json())
+        except (ValueError, TypeError):
+            return frozenset()
+        return frozenset(name for name, on in parsed.capabilities.items() if on)
 
     async def forget(
         self,

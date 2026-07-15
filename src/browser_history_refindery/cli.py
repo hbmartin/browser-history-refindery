@@ -87,7 +87,10 @@ def import_(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Read and filter, but submit nothing."),
+        typer.Option(
+            "--dry-run",
+            help="Build the plan and request resource estimates, but submit nothing.",
+        ),
     ] = False,
     full: Annotated[
         bool,

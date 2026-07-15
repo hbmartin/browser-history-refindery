@@ -13,6 +13,7 @@ from browser_history_refindery.config import (
     PacingConfig,
     PollerConfig,
     ServerConfig,
+    SubmitConfig,
     load_or_create,
 )
 
@@ -121,10 +122,21 @@ def test_pacing_out_of_range_rejected(kwargs):
         PacingConfig(**kwargs)
 
 
-@pytest.mark.parametrize("batch_size", [0, -3])
-def test_poller_batch_size_must_be_positive(batch_size):
+@pytest.mark.parametrize("batch_size", [0, -3, 501])
+def test_poller_batch_size_out_of_range_rejected(batch_size):
     with pytest.raises(ValidationError):
         PollerConfig(batch_size=batch_size)
+
+
+@pytest.mark.parametrize("batch_size", [0, -3, 101])
+def test_submit_batch_size_out_of_range_rejected(batch_size):
+    with pytest.raises(ValidationError):
+        SubmitConfig(batch_size=batch_size)
+
+
+def test_submit_batch_size_defaults():
+    assert SubmitConfig().batch_size == 50
+    assert AppConfig().submit.batch_size == 50
 
 
 @pytest.mark.parametrize(

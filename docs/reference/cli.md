@@ -34,7 +34,7 @@ Read, merge, filter, and submit browser history.
 | `--browser` | `chromium`, `firefox`, or `safari` | None | Declare the schema family used by `--db`; required with it. |
 | `--all` | Flag | Off | Select every discovered profile without a prompt. |
 | `--limit` | Positive integer | Unlimited | Submit at most this many eligible URLs, newest first. |
-| `--dry-run` | Flag | Off | Build and report the plan without contacting Refindery. |
+| `--dry-run` | Flag | Off | Build the plan, request storage/cost estimates from Refindery, and submit nothing. |
 | `--full` | Flag | Off | Ignore read watermarks; local submission deduplication still applies. |
 | `--help` | Flag | — | Show command help. |
 
@@ -42,6 +42,12 @@ No discovered databases is a runtime error with exit status `1`. A missing
 `--browser` for `--db`, a missing database file, or a non-positive limit is a
 usage error with status `2`. Cancelling the interactive profile picker exits
 without submitting.
+
+A non-empty dry run makes a one-shot readiness probe and uses
+`POST /v1/pages/estimate/batch` when the server advertises `batch_estimate` and
+a token is available. Estimation failures do not fail the command: unresolved
+pages use the cached profile for that `server.base_url`, or show unavailable
+totals if no profile has been cached yet.
 
 ## `list-profiles`
 

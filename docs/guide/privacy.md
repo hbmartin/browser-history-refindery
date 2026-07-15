@@ -18,12 +18,14 @@ To avoid reading a live browser database in place, the database and any
 read-only and removed when the reader finishes.
 
 The local state database stores URLs, Refindery page IDs, outcomes, errors,
-timestamps, status, profile watermarks, and exclusion reasons. Protect it as
-sensitive browsing data.
+timestamps, status, profile watermarks, exclusion reasons, and a non-secret
+fallback estimation profile for each backend. Protect it as sensitive browsing
+data.
 
 ## What Refindery receives
 
-For an eligible URL, `POST /v1/pages` contains:
+For an eligible URL, `POST /v1/pages/batch` and the dry-run-only
+`POST /v1/pages/estimate/batch` contain:
 
 - `url`;
 - the browser title, when available;
@@ -34,14 +36,17 @@ For an eligible URL, `POST /v1/pages` contains:
 - combined visit count plus first and last visit timestamps; and
 - a per-profile source list when the URL appeared in more than one profile.
 
-The bearer token is sent in the HTTP `Authorization` header. Refindery then
-fetches and extracts the page using its own network access and policies.
+The bearer token is sent in the HTTP `Authorization` header. During a real
+import, Refindery fetches, extracts, persists, and indexes the page. During a
+dry run, Refindery may fetch, extract, and chunk it to calculate the estimate,
+but the API contract forbids persisting the page or invoking paid providers.
 
 !!! warning "History is metadata"
 
     Even without page bodies, URLs, titles, profile names, timestamps, and the
-    machine hostname can be sensitive. Review a dry run and exclusion settings
-    before the first real import.
+    machine hostname can be sensitive. Local exclusions run before both ingest
+    and estimation, but a dry run is not offline: review the exclusion settings
+    before running it.
 
 ## Always-on local exclusions
 

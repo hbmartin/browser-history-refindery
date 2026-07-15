@@ -1,6 +1,7 @@
 """Profile selection, the live import dashboard, and end-of-run reports."""
 
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import Protocol
 
 import questionary
@@ -18,6 +19,7 @@ from rich.progress import (
 from rich.table import Table
 
 from browser_history_refindery.browsers import BrowserProfile
+from browser_history_refindery.estimation import DryRunEstimate
 from browser_history_refindery.stats import RunStats
 
 
@@ -218,7 +220,11 @@ def print_summary(console: Console, stats: RunStats, *, interrupted: bool) -> No
 
 
 def print_dry_run_report(
-    console: Console, stats: RunStats, submissions: Sequence[UrlDisplay]
+    console: Console,
+    stats: RunStats,
+    submissions: Sequence[UrlDisplay],
+    *,
+    estimate: DryRunEstimate,
 ) -> None:
     """Print what an import run would do, without submitting anything."""
     console.print("\n[bold]Dry run[/] — nothing was submitted.\n")
@@ -227,7 +233,7 @@ def print_dry_run_report(
     table.add_column(justify="right")
     table.add_row("history URLs read", str(stats.urls_read_total))
     table.add_row("unique URLs", str(stats.unique_urls))
-    table.add_row("would submit", str(stats.total_to_submit))
+    table.add_row("eligible pages", str(estimate.total_pages))
     table.add_row("already submitted", str(stats.already_submitted))
     table.add_row("previously rejected", str(stats.previously_rejected))
     table.add_row("skipped by rules", str(stats.skipped))
@@ -235,9 +241,81 @@ def print_dry_run_report(
     for kind, count in stats.skip_reasons.most_common():
         console.print(f"  [dim]skipped by {kind}: {count}[/]")
     console.print(_profiles_table(stats))
+    _print_domain_counts(console, estimate)
+    _print_estimates(console, estimate)
     if submissions:
         console.print("\n[bold]Newest URLs that would be submitted:[/]")
         for submission in submissions[:10]:
             console.print(f"  {submission.url}")
         if len(submissions) > 10:
             console.print(f"  [dim]... and {len(submissions) - 10} more[/]")
+
+
+def _format_bytes(value: int) -> str:
+    """Render a non-negative byte estimate with IEC units."""
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = Decimal(value)
+    for unit in units:
+        if amount < 1_024 or unit == units[-1]:
+            if unit == "B":
+                return f"{value} B"
+            return f"{amount.quantize(Decimal('0.1'))} {unit}"
+        amount /= 1_024
+    return f"{value} B"
+
+
+def _format_usd(value: Decimal) -> str:
+    """Render USD without scientific notation and with at least two decimals."""
+    rendered = format(value, "f")
+    whole, separator, fraction = rendered.partition(".")
+    if not separator:
+        return f"${whole}.00"
+    fraction = fraction.rstrip("0")
+    return f"${whole}.{fraction.ljust(2, '0')}"
+
+
+def _print_domain_counts(console: Console, estimate: DryRunEstimate) -> None:
+    console.print("\n[bold]Pages per domain:[/]")
+    if not estimate.domains:
+        console.print("  [dim]no eligible pages[/]")
+        return
+    table = Table(box=None, pad_edge=False)
+    table.add_column("domain")
+    table.add_column("pages", justify="right")
+    for domain, count in estimate.domains:
+        table.add_row(domain, str(count))
+    console.print(table)
+
+
+def _print_estimates(console: Console, estimate: DryRunEstimate) -> None:
+    console.print("\n[bold]Incremental resource estimate:[/]")
+    table = Table(box=None, pad_edge=False)
+    table.add_column(style="bold")
+    table.add_column(justify="right")
+    storage = (
+        "unavailable"
+        if estimate.storage_bytes is None
+        else _format_bytes(estimate.storage_bytes)
+    )
+    cost = (
+        "unavailable"
+        if estimate.cost_usd is None
+        else f"{_format_usd(estimate.cost_usd)} USD"
+    )
+    table.add_row("estimated storage", storage)
+    table.add_row("estimated total cost", cost)
+    table.add_row("live estimates", str(estimate.live_pages))
+    table.add_row("fallback profile", str(estimate.fallback_pages))
+    table.add_row("zero incremental impact", str(estimate.zero_impact_pages))
+    table.add_row("unavailable", str(estimate.unavailable_pages))
+    console.print(table)
+
+    if estimate.cost_usd is not None and estimate.cost_breakdown_usd:
+        breakdown = Table(box=None, pad_edge=False)
+        breakdown.add_column("cost component")
+        breakdown.add_column("USD", justify="right")
+        for component, amount in estimate.cost_breakdown_usd.items():
+            breakdown.add_row(component, _format_usd(amount))
+        console.print(breakdown)
+    for note in estimate.notes:
+        console.print(f"  [yellow]{note}[/]")

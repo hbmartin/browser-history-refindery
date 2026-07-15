@@ -29,9 +29,9 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 
 ## Architecture (refindery-import)
 - Entry point: `refindery-import = browser_history_refindery.cli:app` (Typer). Running with no subcommand starts a default interactive import via the app callback.
-- `pipeline.run_import` is the orchestrator: fully-materializing producer (read → merge → dedup → filter), then an asyncio TaskGroup of submitter + status poller + backlog watcher, with a `rich` Live dashboard refreshed by a separate task that is cancelled after the group exits (avoids termination coordination).
+- `pipeline.run_import` orchestrates a TaskGroup of streaming producer + submitter + status poller + backlog watcher. Unbounded imports enqueue each profile while later profiles are still read; `--limit` fully materializes all profiles for a global newest-first cutoff. A separate `rich` Live refresh task is cancelled after the group exits.
 - Correctness rule: the `submissions` table in the local state DB is the source of truth for dedup/resume; per-profile watermarks are only an optimization and advance only after a clean, error-free run.
-- State schema v3 stores `last_visit_at` for each submission and run-level rejected counts; older databases backfill visit times from `submitted_at` and add the rejected counter during migration.
+- State schema v4 stores `last_visit_at` for each submission, run-level rejected counts, and one validated dry-run estimation fallback profile per normalized Refindery base URL; older databases backfill visit times from `submitted_at`, add the rejected counter, and create the profile cache during migration.
 - Browser readers are sync (stdlib sqlite3 over a tempdir snapshot copy of the DB + WAL/SHM) called via `asyncio.to_thread`; the state store uses aiosqlite.
 - Epoch conversions: Chromium = µs since 1601-01-01 (offset 11_644_473_600 s from Unix), Firefox = µs since Unix epoch, Safari = float seconds since 2001-01-01 (offset 978_307_200 s). Golden tests in `tests/test_times.py`.
 
@@ -55,3 +55,31 @@ Update AGENTS.md with notes, learnings, findings, or other useful patters you ha
 - `BrowserProfile.key` is the readable `browser_id:profile_dir` stats key and can collide across distinct history paths; use the path-aware `BrowserProfile.watermark_key` for persisted watermark lookups and `--limit` pruning. Watermark tests should use same-family profiles with the same profile directory name to cover collisions explicitly.
 - Persisted path-based identities must normalize with `Path.resolve()` before stringification so equivalent relative and absolute history paths cannot create duplicate watermark rows.
 - Safari incremental reads limit visit aggregates to the post-watermark window, but title fallback must search the URL's full visit history so an untitled revisit can reuse an older title.
+- Streaming submissions must persist the same immutable snapshot used to build the HTTP request; the shared merge object can gain later-profile visits while the request is in flight.
+- With revisit resubmission enabled, a URL successfully sent before a later-profile merge must be queued again for the newer visit; otherwise advancing that profile's watermark can hide the unsent revisit on the next run.
+- A shared URL classified as already submitted must be reconsidered if a later profile raises its merged visit time past the stored submission time and revisit resubmission is enabled.
+- UI helpers that only read URLs accept a structural `UrlDisplay` protocol and a read-only `Sequence`; this keeps tests and callers type-safe without coupling presentation code to pipeline models.
+- When a test must inspect Loguru's untyped private `_core`, confine an explicit `Any` cast to that introspection point rather than suppressing an unrelated attribute diagnostic.
+- Full URLs, including query strings, remain the identity used for merging, submission, and persisted state. Log displays remove query/fragment contents and replace them with a stable fingerprint so distinct URLs remain distinguishable without leaking sensitive values.
+- A profile reader may yield repeated records for one full URL; merge every record, but classify and enqueue that URL only once per profile.
+- Mutable streaming submissions carry explicit queue-membership state. Keep every queue transition in `_Runner._enqueue`, leave the flag set while the submitter reserves an item for pacing, and clear it only when the HTTP attempt begins so later profile merges cannot create duplicate requests.
+- Queue-state tests should cover both duplicate rejection and shutdown after pacing; the latter must restore the submitter's reserved item without clearing its `queued` flag.
+- Dry runs always make a one-shot readiness probe for non-empty plans and use `POST /v1/pages/estimate/batch` only when `batch_estimate` is advertised and a token is available. Estimation failures never fail the dry run: use the cached per-server fallback profile only for unresolved pages, and show unavailable totals when no profile exists.
+- Estimate money values stay as `Decimal` from validated pydantic wire models through aggregation and formatting. A null total must carry `unpriced_components`; never interpret missing provider pricing as zero.
+
+## Documentation
+- The Zensical site is configured in `zensical.toml`; its curated Markdown lives under `docs/`, and generated `site/` output is gitignored.
+- The explicit navigation in `zensical.toml` is authoritative. Add every published page there and keep CLI, config, browser, privacy, and backend-contract references synchronized with code changes.
+- Cross-cutting operational answers belong in `docs/reference/faq.md`; keep task instructions in the guides and error remediation in troubleshooting, then cross-link instead of maintaining divergent explanations.
+- The CLI has no dedicated offline mode. `list-profiles` avoids backend access, but every non-empty `--dry-run` probes Refindery and may send eligible page metadata for live estimation; dry run can also create or update local config/state records, while a real import always requires Refindery.
+- Documentation is intentionally curated rather than generated from internal Python modules; package internals are not a stable public API.
+- CI installs only the locked docs dependency group and builds with `uv run --no-sync zensical build --clean --strict`. GitHub Pages must be enabled with GitHub Actions in repository settings; the workflow does not enable it through the API.
+- `uv run --only-group docs zensical serve` is supported by the project's current `uv`; retain the flag when documenting an isolated docs-only authoring environment.
+- Once `project.markdown_extensions` is present, keep Zensical's standard extension set explicit alongside Mermaid's custom fence; otherwise syntax such as button attribute lists, admonitions, or key glyphs can render as raw Markdown.
+
+## GitHub automation
+- Core CI runs on Ubuntu with Python 3.13 and 3.14; quality and package metadata checks use Python 3.13, and the package job installs the built wheel in a clean environment before exercising the CLI.
+- Stable releases use `vX.Y.Z` tags that must match both `project.version` and `browser_history_refindery.__version__`. The PyPI workflow builds without elevated permissions, then publishes from a separate `pypi` environment job using OIDC.
+- Adapted workflows pin every action to an immutable commit SHA, disable checkout credential persistence, declare least-privilege permissions, and cancel stale runs where safe. Dependabot is responsible for refreshing action pins.
+- `docs.yml` is owned by the documentation pipeline and was deliberately left unchanged by the GitHub automation adaptation; validate hardened workflows separately when running Zizmor for this change.
+- Release Drafter excludes labeled pull requests through its root-level `exclude-labels`; `pre-exclude` is not a supported category type.

@@ -7,11 +7,14 @@ from types import TracebackType
 from typing import Self
 
 import aiosqlite
+from pydantic import ValidationError
 
+from browser_history_refindery.api_models import EstimateFallbackProfile
 from browser_history_refindery.browsers.base import BrowserProfile
 from browser_history_refindery.filters import SkipReason
+from browser_history_refindery.logsetup import logger
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -62,11 +65,21 @@ CREATE TABLE IF NOT EXISTS profile_watermarks (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (browser_id, history_path)
 );
+
+CREATE TABLE IF NOT EXISTS estimation_profiles (
+    server_base_url TEXT PRIMARY KEY,
+    profile_json    TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
 def _now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
+
+
+def _server_key(base_url: str) -> str:
+    return base_url.rstrip("/")
 
 
 class StateSchemaTooNewError(RuntimeError):
@@ -296,6 +309,47 @@ class StateStore:
             """
         )
         return {row[0]: row[1] for row in await cursor.fetchall()}
+
+    async def get_estimation_profile(
+        self, *, server_base_url: str
+    ) -> EstimateFallbackProfile | None:
+        """Load and validate the cached fallback profile for one backend."""
+        cursor = await self._db.execute(
+            "SELECT profile_json FROM estimation_profiles WHERE server_base_url = ?",
+            (_server_key(server_base_url),),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            return EstimateFallbackProfile.model_validate_json(row[0])
+        except (ValidationError, ValueError, TypeError) as exc:
+            logger.warning(
+                "ignoring invalid cached estimation profile for {}: {}",
+                _server_key(server_base_url),
+                exc,
+            )
+            return None
+
+    async def set_estimation_profile(
+        self, *, server_base_url: str, profile: EstimateFallbackProfile
+    ) -> None:
+        """Cache the latest validated fallback profile for one backend."""
+        await self._db.execute(
+            """
+            INSERT INTO estimation_profiles (server_base_url, profile_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(server_base_url) DO UPDATE SET
+                profile_json = excluded.profile_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _server_key(server_base_url),
+                profile.model_dump_json(),
+                _now_iso(),
+            ),
+        )
+        await self._db.commit()
 
     async def get_watermark(self, profile: BrowserProfile) -> datetime | None:
         """Return the profile's incremental-import high-water mark, if any."""

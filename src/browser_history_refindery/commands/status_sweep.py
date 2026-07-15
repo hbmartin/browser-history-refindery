@@ -3,18 +3,23 @@
 import asyncio
 from pathlib import Path
 
-import httpx2
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from browser_history_refindery.api_client import RefinderyClient, ServerError
+from browser_history_refindery.api_client import (
+    RefinderyClient,
+    RequiresBatchApiError,
+)
+from browser_history_refindery.api_models import (
+    MAX_STATUS_BATCH,
+    PageStatusBatchFoundResult,
+)
 from browser_history_refindery.config import AppConfig, load_or_create
 from browser_history_refindery.logsetup import configure_logging
 from browser_history_refindery.state import StateStore
 
-_SWEEP_BATCH = 500
-_INTER_REQUEST_SLEEP = 0.1
+_SWEEP_BATCH = MAX_STATUS_BATCH
 
 
 async def _sweep(config_path: Path, console: Console) -> None:
@@ -49,19 +54,20 @@ async def _poll_pages(
         request_timeout=config.server.request_timeout,
         ready_timeout=config.server.ready_timeout,
     ) as client:
+        await client.wait_ready()
+        if not client.supports_batch_status:
+            raise RequiresBatchApiError("batch_status")
         with console.status(f"polling {len(page_ids)} pages..."):
-            for page_id in page_ids:
-                try:
-                    status = await client.page_status(page_id)
-                except (httpx2.HTTPError, ServerError):
+            results = await client.page_status_batch(page_ids)
+            for result in results:
+                if not isinstance(result, PageStatusBatchFoundResult):
                     continue
                 await state.update_page_status(
-                    page_id=page_id,
-                    status=status.status,
-                    last_error=status.last_error,
+                    page_id=result.page_id,
+                    status=result.status,
+                    last_error=result.last_error,
                 )
                 updated += 1
-                await asyncio.sleep(_INTER_REQUEST_SLEEP)
     console.print(f"updated {updated} of {len(page_ids)} pending pages.")
 
 
